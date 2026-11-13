@@ -1,7 +1,7 @@
-# CLAUDE.md - Guidelines for skflow
+# CLAUDE.md - Guidelines for agent-skill-map
 
 ## Project Overview
-`skflow` is an ultra-fast Rust-based AI agent skill mapper, linter, and DAG pipeline engine.
+`agent-skill-map` (`asm`) is an ultra-fast Rust-based AI agent skill mapper, linter, and DAG pipeline engine.
 
 ## Commands
 - Build: `cargo build`
