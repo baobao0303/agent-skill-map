@@ -9,10 +9,12 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive", "env"] }
+ctrlc = "3.5.2"
 fancy-regex = "0.20.2"
 hex = "0.4.3"
 icu_collator = "2.4.0"
 ignore = "0.4.34"
+notify = "8.2.2"
 pulldown-cmark = "0.13.6"
 rayon = "1.12.0"
 rusqlite = { version = "0.42.0", features = ["bundled", "fallible_uint"] }

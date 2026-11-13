@@ -141,6 +141,7 @@ fn materialise(s: &Signal) -> Link {
             context: s.context,
         }],
         resolved_target: None,
+        loaded: None,
     }
 }
 
@@ -275,7 +276,10 @@ pub fn lift(links: &mut [Link], idx: &Indexes, lens: &str, reserved: &[String]) 
     let allowed_by_kind = provider::get(lens).map(|p| p.resolution).unwrap_or(&[]);
     for link in links.iter_mut() {
         link.confidence = 1.0;
-        link.resolved_target = resolve_one(link, idx, allowed_by_kind, reserved);
+        // Never clears: a cache-reused link keeps a stale resolution (sm parity).
+        if let Some(r) = resolve_one(link, idx, allowed_by_kind, reserved) {
+            link.resolved_target = Some(r);
+        }
     }
 }
 

@@ -49,7 +49,7 @@ impl Scope {
     }
 
     /// Append one NDJSON record to `operations.log`.
-    pub fn log_operation(&self, op: &str, outcome: &str, detail: &str) {
+    pub fn log_operation(&self, op: &str, channel: &str, outcome: &str, detail: &str) {
         let at = time::OffsetDateTime::now_utc();
         let at = format!(
             "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
@@ -62,7 +62,7 @@ impl Scope {
             at.millisecond()
         );
         let line = crate::jsjson::to_string(&serde_json::json!({
-            "at": at, "op": op, "target": "*", "channel": "cli", "outcome": outcome, "detail": detail,
+            "at": at, "op": op, "target": "*", "channel": channel, "outcome": outcome, "detail": detail,
         }));
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(self.dir().join("operations.log")) {
             let _ = writeln!(f, "{line}");

@@ -52,6 +52,31 @@ pub enum Command {
         /// Compute without writing the database.
         #[arg(short = 'n', long)]
         dry_run: bool,
+        /// Explicit alias of the incremental default.
+        #[arg(long)]
+        changed: bool,
+        /// Force a complete re-extraction (renames are still detected).
+        #[arg(long)]
+        full: bool,
+        /// Allow a zero-result scan to wipe a populated DB.
+        #[arg(long)]
+        allow_empty: bool,
+        /// Alias of `watch`.
+        #[arg(long)]
+        watch: bool,
+    },
+    /// Watch the project and rescan after each debounced batch of changes.
+    Watch {
+        /// Skip token counting.
+        #[arg(long)]
+        no_tokens: bool,
+        #[arg(long)]
+        max_scan: Option<u64>,
+        #[arg(long)]
+        max_nodes: Option<u64>,
+        /// Consecutive batch failures before shutting down (0 disables).
+        #[arg(long, default_value_t = 5)]
+        max_consecutive_failures: u32,
     },
     /// Print the current issues from the database.
     Check {
@@ -100,8 +125,28 @@ pub fn dispatch(cli: &Cli) -> Result<u8, CliError> {
     };
     match command {
         Command::Version => version(cli, &scope),
-        Command::Scan { no_tokens, max_scan, max_nodes, dry_run } => {
-            run_scan(cli, &scope, !no_tokens, *max_scan, *max_nodes, *dry_run)
+        Command::Scan { no_tokens, max_scan, max_nodes, dry_run, changed, full, allow_empty, watch: watch_alias } => {
+            if *watch_alias {
+                let conflict = [(*dry_run, "--dry-run", "Drop --dry-run or use --watch alone. The watcher always persists each incremental batch."),
+                    (*changed, "--changed", "Drop --changed or use --watch alone. The watcher is incremental by definition."),
+                    (*full, "--full", "Drop --full or use --watch alone. The watcher is incremental by definition; run a one-shot `sm scan --full` first if you need a clean rebuild."),
+                    (*allow_empty, "--allow-empty", "Drop --allow-empty or use --watch alone. The watcher never produces a zero-result wipe.")]
+                .into_iter()
+                .find(|c| c.0);
+                if let Some((_, flag, hint)) = conflict {
+                    return Err(CliError::Usage(format!("--watch cannot be combined with {flag}.\n   {hint}")));
+                }
+                return run_watch(cli, &scope, !no_tokens, *max_scan, *max_nodes, 5);
+            }
+            if *full && *changed {
+                return Err(CliError::Usage(
+                    "--full and --changed cannot be combined.\n   --changed is the explicit alias of the incremental default and --full forces a complete re-extraction; pick one.".into(),
+                ));
+            }
+            run_scan(cli, &scope, ScanFlags { tokenize: !no_tokens, max_scan: *max_scan, max_nodes: *max_nodes, dry_run: *dry_run, changed: *changed, full: *full, allow_empty: *allow_empty })
+        }
+        Command::Watch { no_tokens, max_scan, max_nodes, max_consecutive_failures } => {
+            run_watch(cli, &scope, !no_tokens, *max_scan, *max_nodes, *max_consecutive_failures)
         }
         Command::Check { node } => check(cli, &scope, node.as_deref()),
         Command::List { kind } => list(cli, &scope, kind.as_deref()),
@@ -176,25 +221,24 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
-fn run_scan(
-    cli: &Cli,
-    scope: &Scope,
+struct ScanFlags {
     tokenize: bool,
     max_scan: Option<u64>,
     max_nodes: Option<u64>,
     dry_run: bool,
-) -> Result<u8, CliError> {
-    if !dry_run {
-        scope.provision().map_err(|e| CliError::Operational(e.to_string()))?;
-    }
-    let lens = resolve_lens(scope, dry_run, cli.global.json)?;
+    changed: bool,
+    full: bool,
+    allow_empty: bool,
+}
+
+fn scan_opts(scope: &Scope, lens: String, tokenize: bool, max_scan: Option<u64>, max_nodes: Option<u64>) -> scan::ScanOpts {
     let settings = scope.settings();
     let ignore = settings
         .get("ignore")
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
         .unwrap_or_default();
-    let opts = scan::ScanOpts {
+    scan::ScanOpts {
         root: scope.root.clone(),
         lens,
         ignore,
@@ -204,17 +248,51 @@ fn run_scan(
         max_file_size: setting_u64(&settings, "maxFileSizeBytes", 1 << 20),
         tokenize,
         follow_external_symlinks: false,
-    };
-    let result = scan::run(&opts);
+        changed: None,
+    }
+}
+
+/// The persisted snapshot and its extractor runs, or `None` when there is
+/// no DB or it holds no nodes.
+fn load_prior(db: &std::path::Path) -> Option<(ScanResult, scan::PriorRuns)> {
+    if !db.exists() {
+        return None;
+    }
+    let conn = store::open_existing(db).ok()?;
+    let prior = store::load(&conn).ok().flatten().filter(|p| !p.nodes.is_empty())?;
+    Some((prior, store::load_extractor_runs(&conn).unwrap_or_default()))
+}
+
+fn run_scan(cli: &Cli, scope: &Scope, flags: ScanFlags) -> Result<u8, CliError> {
+    let ScanFlags { tokenize, max_scan, max_nodes, dry_run, changed, full, allow_empty } = flags;
+    if !dry_run {
+        scope.provision().map_err(|e| CliError::Operational(e.to_string()))?;
+    }
+    let lens = resolve_lens(scope, dry_run, cli.global.json)?;
+    let opts = scan_opts(scope, lens, tokenize, max_scan, max_nodes);
     let db = db_path(cli, scope);
+    let prior = load_prior(&db);
+    if changed && prior.is_none() {
+        eprint!("--changed: no prior snapshot found; running full scan.\n");
+    }
+    let scan::Outcome { mut result, renames, extractor_runs } =
+        scan::run_incremental(&opts, prior.as_ref().map(|p| &p.0), prior.as_ref().filter(|_| !full).map(|p| &p.1), full);
     if !dry_run {
         let mut conn = store::open(&db, &scope.backups_dir()).map_err(|e| CliError::Operational(e.to_string()))?;
-        store::persist(&mut conn, &result).map_err(|e| CliError::Operational(e.to_string()))?;
-        scope.log_operation("scan", "ok", &format!("nodes={} issues={}", result.nodes.len(), result.issues.len()));
+        if result.nodes.is_empty() && !allow_empty {
+            let existing = store::count_scan_rows(&conn).map_err(|e| CliError::Operational(e.to_string()))?;
+            if existing > 0 {
+                return Err(CliError::Usage(format!(
+                    "Refusing to wipe a populated DB ({existing} rows in scan_*) with a zero-result scan.\n   Pass --allow-empty to override. If this is unexpected, double-check the root paths."
+                )));
+            }
+        }
+        store::persist(&mut conn, &mut result, &renames, &extractor_runs).map_err(|e| CliError::Operational(e.to_string()))?;
+        scope.log_operation("scan", "cli", "ok", &format!("nodes={} issues={}", result.nodes.len(), result.issues.len()));
     }
     let errors = result.issues.iter().filter(|i| i.severity == "error").count();
     if cli.global.json {
-        println!("{}", jsjson::to_string(&result));
+        println!("{}", jsjson::to_string(&result.to_json()));
     } else {
         // Distinct affected nodes per severity, not issue counts.
         let affected = |sev: &str| {
@@ -255,6 +333,144 @@ fn run_scan(
         }
     }
     Ok(if errors > 0 { 1 } else { 0 })
+}
+
+/// `sm watch` / `sm scan --watch`: an initial incremental scan, then one
+/// rescan (persisted) per debounced batch of filesystem events until
+/// SIGINT/SIGTERM. Every batch prints one summary line, or one ScanResult
+/// per line under --json.
+fn run_watch(cli: &Cli, scope: &Scope, tokenize: bool, max_scan: Option<u64>, max_nodes: Option<u64>, breaker: u32) -> Result<u8, CliError> {
+    use notify::{RecursiveMode, Watcher};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    let json_mode = cli.global.json;
+    scope.provision().map_err(|e| CliError::Operational(e.to_string()))?;
+    // The watcher detects the lens in memory only: nothing persisted or announced.
+    let lens = resolve_lens(scope, true, json_mode)?;
+    let debounce = scope
+        .settings()
+        .get("scan")
+        .and_then(|s| s.get("watch"))
+        .and_then(|w| w.get("debounceMs"))
+        .and_then(Value::as_u64)
+        .unwrap_or(300);
+    if !json_mode {
+        eprint!("sm watch: starting on 1 root(s), debounce {debounce}ms\n");
+    }
+    let db = db_path(cli, scope);
+    let mut prior = load_prior(&db);
+    let batch = |prior: &Option<(ScanResult, scan::PriorRuns)>,
+                 changed: Option<scan::ChangedPaths>|
+     -> Result<ScanResult, String> {
+        let mut opts = scan_opts(scope, lens.clone(), tokenize, max_scan, max_nodes);
+        opts.changed = changed;
+        let scan::Outcome { mut result, renames, extractor_runs } =
+            scan::run_incremental(&opts, prior.as_ref().map(|p| &p.0), prior.as_ref().map(|p| &p.1), false);
+        let mut conn = store::open(&db, &scope.backups_dir()).map_err(|e| e.to_string())?;
+        store::persist(&mut conn, &mut result, &renames, &extractor_runs).map_err(|e| e.to_string())?;
+        scope.log_operation("scan", "watcher", "ok", &format!("nodes={} issues={}", result.nodes.len(), result.issues.len()));
+        Ok(result)
+    };
+    let render = |r: &ScanResult| {
+        if json_mode {
+            println!("{}", jsjson::to_string(&r.to_json()));
+        } else {
+            let (n, l, i) = (r.nodes.len(), r.links.len(), r.issues.len());
+            println!(
+                "✓  {} · {} · {}   in {}ms",
+                plural(n, "node", "nodes"),
+                plural(l, "link", "links"),
+                plural(i, "issue", "issues"),
+                r.stats.duration_ms
+            );
+        }
+    };
+    let first = batch(&prior, None).map_err(|m| CliError::Operational(format!("sm watch: initial scan failed: {m}")))?;
+    render(&first);
+    // Every batch diffs against the persisted snapshot, as read back.
+    prior = load_prior(&db);
+    // The initial scan is not counted in "stopped after N batch(es)".
+    let mut batches = 0u64;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    let _ = ctrlc::set_handler(move || flag.store(true, Ordering::SeqCst));
+    let (tx, rx) = mpsc::channel();
+    let mut watcher = notify::recommended_watcher(tx).map_err(|e| CliError::Operational(format!("sm watch: watcher error: {e}")))?;
+    watcher
+        .watch(&scope.root, RecursiveMode::Recursive)
+        .map_err(|e| CliError::Operational(format!("sm watch: watcher error: {e}")))?;
+    if !json_mode {
+        eprint!("sm watch: ready. Press Ctrl+C to stop.\n");
+    }
+    let ignore = scan::ignore_matcher(&scan_opts(scope, lens.clone(), tokenize, max_scan, max_nodes));
+    // Root-relative POSIX paths of the files an event touched, minus ignored ones.
+    let touched = |ev: &notify::Event| -> Vec<String> {
+        if matches!(ev.kind, notify::EventKind::Access(_)) {
+            return Vec::new();
+        }
+        ev.paths
+            .iter()
+            .filter_map(|p| p.strip_prefix(&scope.root).ok())
+            .filter(|rel| !rel.as_os_str().is_empty() && !scope.root.join(rel).is_dir())
+            .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+            .filter(|rel| !ignore.matched_path_or_any_parents(rel, false).is_ignore())
+            .collect()
+    };
+    let mut pending: Vec<String> = Vec::new();
+    let mut failures = 0u32;
+    let mut code = 0u8;
+    while !stop.load(Ordering::SeqCst) {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(Ok(ev)) => pending.extend(touched(&ev)),
+            Ok(Err(e)) => eprintln!("✕  sm watch: watcher error: {}", format::sanitize(&e.to_string())),
+            Err(_) => {}
+        }
+        if pending.is_empty() {
+            continue;
+        }
+        // Debounce: keep collecting until the tree is quiet for `debounce` ms.
+        while let Ok(ev) = rx.recv_timeout(Duration::from_millis(debounce)) {
+            if let Ok(ev) = ev {
+                pending.extend(touched(&ev));
+            }
+        }
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut changed = scan::ChangedPaths::default();
+        for rel in pending.drain(..).filter(|r| seen.insert(r.clone())) {
+            if scope.root.join(&rel).is_file() {
+                changed.changed.push(rel);
+            } else {
+                changed.removed.push(rel);
+            }
+        }
+        match batch(&prior, Some(changed)) {
+            Ok(r) => {
+                render(&r);
+                prior = load_prior(&db);
+                batches += 1;
+                failures = 0;
+            }
+            Err(m) => {
+                eprintln!("✕  sm watch: batch failed: {}", format::sanitize(&m));
+                failures += 1;
+                if breaker > 0 && failures >= breaker {
+                    eprint!("✕  sm watch: {failures} consecutive batch failures, shutting down.\n   Last error: {m}\n");
+                    code = 2;
+                    break;
+                }
+            }
+        }
+    }
+    if !json_mode {
+        eprint!("sm watch: stopped after {batches} batch(es).\n");
+    }
+    Ok(code)
 }
 
 pub fn format_elapsed(ms: u64) -> String {

@@ -37,6 +37,9 @@ pub struct Node {
     pub sidecar: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_refs: Option<Vec<ExternalRef>>,
+    /// Read back from the DB (a cache-reused node keeps that key order).
+    #[serde(skip)]
+    pub loaded: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -91,6 +94,9 @@ pub struct Link {
     pub occurrences: Vec<Occurrence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_target: Option<String>,
+    /// `Some(had resolvedTarget)` when read back from the DB.
+    #[serde(skip)]
+    pub loaded: Option<bool>,
 }
 
 /// An analyzer or kernel finding. `detail`, `fix` and `data` live in an
@@ -177,4 +183,43 @@ pub struct ScanResult {
     pub links: Vec<Link>,
     pub issues: Vec<Issue>,
     pub stats: Stats,
+}
+
+const LOADED_NODE_ORDER: [&str; 16] = [
+    "path", "kind", "provider", "bodyHash", "frontmatterHash", "bytes", "linksOutCount", "linksInCount",
+    "externalRefsCount", "frontmatter", "sidecar", "tokens", "externalRefs", "modifiedAtMs", "virtual", "derivedFrom",
+];
+const LOADED_LINK_ORDER: [&str; 10] =
+    ["source", "target", "kind", "confidence", "sources", "trigger", "location", "occurrences", "resolvedTarget", "raw"];
+
+fn reorder(v: &mut Value, order: &[&str], append_last: Option<&str>) {
+    let Some(obj) = v.as_object_mut() else { return };
+    let mut out = serde_json::Map::new();
+    for k in order.iter().filter(|k| Some(**k) != append_last) {
+        if let Some(x) = obj.remove(*k) {
+            out.insert((*k).into(), x);
+        }
+    }
+    out.append(obj);
+    *obj = out;
+}
+
+impl ScanResult {
+    /// The stdout document. Entities reused from the prior snapshot keep the
+    /// key order of the DB read-back, as the original's object spread does;
+    /// a `resolvedTarget` added to a reused link after load lands last.
+    pub fn to_json(&self) -> Value {
+        let mut v = serde_json::to_value(self).unwrap_or_default();
+        for (n, j) in self.nodes.iter().zip(v["nodes"].as_array_mut().into_iter().flatten()) {
+            if n.loaded {
+                reorder(j, &LOADED_NODE_ORDER, None);
+            }
+        }
+        for (l, j) in self.links.iter().zip(v["links"].as_array_mut().into_iter().flatten()) {
+            if let Some(had) = l.loaded {
+                reorder(j, &LOADED_LINK_ORDER, (!had).then_some("resolvedTarget"));
+            }
+        }
+        v
+    }
 }

@@ -31,7 +31,10 @@ fn main() -> ExitCode {
             e.exit_code()
         }
     };
-    let prints_elapsed = !matches!(cli.command, Some(cli::Command::Version) | None);
+    let prints_elapsed = !matches!(
+        cli.command,
+        Some(cli::Command::Version | cli::Command::Watch { .. } | cli::Command::Scan { watch: true, .. }) | None
+    );
     if prints_elapsed && !cli.global.quiet {
         eprint!("\ndone in {}\n", cli::format_elapsed(started.elapsed().as_millis() as u64));
     }

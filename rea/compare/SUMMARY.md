@@ -18,3 +18,21 @@ Oracle: `@skill-map/cli@1.12.7` (`oracle/node_modules/.bin/sm`). Candidate: `tar
 \* REA reports the terminal dimension `changed` because the two processes flush the same bytes in a different number of PTY frames (sm 2 frames, asm 1 to 3). Joining the frames gives byte-identical output.
 
 Known divergence: `.claude/skills/bom/SKILL.md` counts 17 body tokens in sm and 16 in asm. gpt-tokenizer's pre-tokenizer treats U+FEFF as whitespace (JavaScript `\s`), tiktoken-rs does not.
+
+# P2 differential verification (incremental scan, renames, watch)
+
+Scenario scripts under `conformance/scenarios/` run the same edit sequence under both binaries in sibling work directories; `jsondiff.py` compares the ScanResult documents modulo `scannedAt`, `scannedBy`, `durationMs`, `modifiedAtMs` (file times differ between the two copies) and the known BOM token count. A raw byte comparison with the same fields masked was also run.
+
+| Scenario | Result |
+|---|---|
+| `renames.sh`: scan → move / move+edit / delete / in-place edit → scan → scan → `scan --full` | all 4 documents byte-identical |
+| `scan_extractor_runs` after the scenario | 219 rows, identical (ran_at excluded) |
+| state migration: favorite on a renamed node + a stranded `ghost.md` row | same `state_node_favorites` rows, same stranded `orphan` issue |
+| `--full --changed`, `--watch --full`, `--changed` without prior, zero-result wipe guard, `--allow-empty` | same stderr text and exit codes |
+| `watch.sh`: `watch --json` while editing, renaming, editing | 4 ndjson batches byte-identical; same stderr |
+
+REA (`rea/compare.sh`) on second scans (the cache-hit path): `check` terminal unchanged; `scan` / `scan --json` diverge only on the duration suffix, `scannedAt` and `scannedBy`.
+
+Incremental semantics ported from the original, including its quirks: a cache-hit node reuses its prior links verbatim, so a link resolved against a since-deleted node keeps its stale `resolvedTarget` (lift never clears one); reused nodes and links keep the DB read-back key order; untouched files (same mtime) are claimed by their prior owner inside the current provider's walk; watcher batches walk only the changed paths and then re-inject the remaining prior nodes in prior order.
+
+Not ported: the partial cache hit (some but not all of a node's extractors still valid) re-extracts the node fully; it arises only when one extractor's settings change.

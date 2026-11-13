@@ -55,9 +55,138 @@ fn opt_json<T: serde::Serialize>(v: &Option<T>) -> Option<String> {
     v.as_ref().map(|x| json(x))
 }
 
+/// Re-point every `state_*` reference of a renamed node (`migrateNodeFks`).
+/// On a primary-key collision at the new path the existing row wins and the
+/// migrating one is dropped.
+fn migrate_node_fks(tx: &rusqlite::Transaction, from: &str, to: &str) -> rusqlite::Result<()> {
+    if from == to {
+        return Ok(());
+    }
+    tx.execute("UPDATE state_jobs SET node_id = ?2 WHERE node_id = ?1", params![from, to])?;
+    let rows: Vec<(i64, String)> = {
+        let mut st = tx.prepare(
+            "SELECT id, node_ids_json FROM state_executions
+             WHERE EXISTS (SELECT 1 FROM json_each(state_executions.node_ids_json) je WHERE je.value = ?1)",
+        )?;
+        st.query_map([from], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?
+    };
+    for (id, ids) in rows {
+        let ids: Vec<String> = serde_json::from_str(&ids).unwrap_or_default();
+        let ids: Vec<&str> = ids.iter().map(|p| if p == from { to } else { p.as_str() }).collect();
+        tx.execute("UPDATE state_executions SET node_ids_json = ?2 WHERE id = ?1", params![id, serde_json::to_string(&ids).unwrap()])?;
+    }
+    tx.execute("UPDATE state_findings SET node_id = ?2 WHERE node_id = ?1", params![from, to])?;
+    for (table, col) in [("state_summaries", "node_id"), ("state_enrichments", "node_id")] {
+        tx.execute(&format!("UPDATE OR IGNORE {table} SET {col} = ?2 WHERE {col} = ?1"), params![from, to])?;
+        tx.execute(&format!("DELETE FROM {table} WHERE {col} = ?1"), [from])?;
+    }
+    if !from.is_empty() {
+        tx.execute("UPDATE OR IGNORE state_plugin_kvs SET node_id = ?2 WHERE node_id = ?1", params![from, to])?;
+        tx.execute("DELETE FROM state_plugin_kvs WHERE node_id = ?1", [from])?;
+    }
+    for table in ["state_node_favorites", "state_activity_stats"] {
+        tx.execute(&format!("UPDATE OR IGNORE {table} SET node_path = ?2 WHERE node_path = ?1"), params![from, to])?;
+        tx.execute(&format!("DELETE FROM {table} WHERE node_path = ?1"), [from])?;
+    }
+    tx.execute("UPDATE OR IGNORE state_activity_pairs SET parent = ?2 WHERE parent = ?1", params![from, to])?;
+    tx.execute("DELETE FROM state_activity_pairs WHERE parent = ?1", [from])?;
+    tx.execute("UPDATE OR IGNORE state_activity_pairs SET child_node_path = ?2 WHERE child_node_path = ?1", params![from, to])?;
+    tx.execute("DELETE FROM state_activity_pairs WHERE child_node_path = ?1", [from])?;
+    tx.execute("UPDATE node_enrichments SET node_path = ?2 WHERE node_path = ?1", params![from, to])?;
+    Ok(())
+}
+
+/// `state_*` rows whose node left the scan without a rename match surface
+/// as `orphan` info issues (unless the rename pass already reported them).
+fn append_stranded_orphans(tx: &rusqlite::Transaction, scan: &mut ScanResult) -> rusqlite::Result<()> {
+    let live: std::collections::HashSet<&str> = scan.nodes.iter().map(|n| n.path.as_str()).collect();
+    let known: std::collections::HashSet<String> = scan
+        .issues
+        .iter()
+        .filter(|i| i.analyzer_id == "orphan")
+        .filter_map(|i| i.get("data").and_then(|d| d.get("path")).and_then(Value::as_str).map(str::to_string))
+        .collect();
+    let mut st = tx.prepare(
+        "SELECT node_id AS value FROM state_jobs
+         UNION SELECT je.value FROM state_executions, json_each(state_executions.node_ids_json) je
+         UNION SELECT node_id FROM state_summaries
+         UNION SELECT node_id FROM state_findings
+         UNION SELECT node_id FROM state_enrichments
+         UNION SELECT node_id FROM state_plugin_kvs WHERE node_id != ''
+         UNION SELECT node_path FROM state_node_favorites",
+    )?;
+    let mut stranded: Vec<String> = st
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|p| !live.contains(p.as_str()))
+        .collect();
+    drop(st);
+    stranded.sort();
+    stranded.dedup();
+    for path in stranded {
+        if known.contains(&path) || path.starts_with("sm://") {
+            continue;
+        }
+        scan.issues.push(
+            crate::model::Issue::new(
+                "orphan",
+                "info",
+                vec![path.clone()],
+                format!("Orphan history: {path} has stranded state_* references but no live node."),
+            )
+            .data(serde_json::json!({ "path": path })),
+        );
+    }
+    scan.stats.issues_count = scan.issues.len() as u64;
+    Ok(())
+}
+
+/// The persisted `scan_extractor_runs`, keyed for the cache decision.
+pub fn load_extractor_runs(conn: &Connection) -> rusqlite::Result<crate::scan::PriorRuns> {
+    let mut out = crate::scan::PriorRuns::new();
+    let mut st = conn.prepare(
+        "SELECT node_path, extractor_id, body_hash_at_run, sidecar_annotations_hash_at_run, settings_hash_at_run FROM scan_extractor_runs",
+    )?;
+    let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, (r.get(2)?, r.get(3)?, r.get(4)?))))?;
+    for row in rows {
+        let (path, id, key) = row?;
+        out.entry(path).or_default().insert(id, key);
+    }
+    Ok(out)
+}
+
+/// Rows currently in the scan zone (the zero-result wipe guard).
+pub fn count_scan_rows(conn: &Connection) -> rusqlite::Result<u64> {
+    let mut total = 0u64;
+    for t in ["scan_nodes", "scan_links", "scan_issues"] {
+        total += conn.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get::<_, i64>(0))? as u64;
+    }
+    Ok(total)
+}
+
 /// Replace-all persist of one scan in a single transaction.
-pub fn persist(conn: &mut Connection, scan: &ScanResult) -> rusqlite::Result<()> {
+pub fn persist(
+    conn: &mut Connection,
+    scan: &mut ScanResult,
+    renames: &[crate::scan::Rename],
+    runs: &[crate::scan::ExtractorRun],
+) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
+    for r in renames {
+        migrate_node_fks(&tx, &r.from, &r.to)?;
+    }
+    append_stranded_orphans(&tx, scan)?;
+    tx.execute("DELETE FROM scan_extractor_runs", [])?;
+    {
+        let mut st = tx.prepare(
+            "INSERT OR REPLACE INTO scan_extractor_runs (node_path, extractor_id, body_hash_at_run, sidecar_annotations_hash_at_run,
+             settings_hash_at_run, ran_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for r in runs {
+            st.execute(params![r.node_path, r.extractor_id, r.body_hash, r.sidecar_annotations_hash, r.settings_hash, r.ran_at])?;
+        }
+    }
     for t in ["scan_nodes", "scan_links", "scan_issues", "scan_meta", "scan_node_tags", "scan_link_scores"] {
         tx.execute(&format!("DELETE FROM {t}"), [])?;
     }
@@ -258,6 +387,7 @@ pub fn load(conn: &Connection) -> rusqlite::Result<Option<ScanResult>> {
                         })
                         .collect()
                 }),
+                loaded: true,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -290,6 +420,7 @@ pub fn load(conn: &Connection) -> rusqlite::Result<Option<ScanResult>> {
                     })
                     .collect(),
                 resolved_target: r.get("resolved_target")?,
+                loaded: Some(r.get::<_, Option<String>>("resolved_target")?.is_some()),
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
