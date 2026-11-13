@@ -25,6 +25,8 @@ pub struct ScanOpts {
     pub follow_external_symlinks: bool,
     /// Watcher batches: the files that changed / disappeared since the prior.
     pub changed: Option<ChangedPaths>,
+    /// `plugins.core.extensions.reference-broken.settings.ignored-references`.
+    pub ignored_references: Vec<(String, String)>,
 }
 
 #[derive(Default, Clone)]
@@ -374,6 +376,7 @@ pub fn run_incremental(opts: &ScanOpts, prior: Option<&ScanResult>, prior_runs: 
         signals: &signals,
         rejections: &rejections,
         orphan_sidecars: &orphans,
+        ignored_references: &opts.ignored_references,
     }));
 
     let renames = match prior {
@@ -864,6 +867,7 @@ mod tests {
             tokenize: true,
             follow_external_symlinks: false,
             changed: None,
+            ignored_references: Vec::new(),
         };
         // Absolute paths in messages (invalid-sidecar) are recorded as `<ROOT>`.
         let ours_text = crate::jsjson::to_string(&run(&opts)).replace(&opts.root.display().to_string(), "<ROOT>");

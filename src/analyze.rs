@@ -26,6 +26,8 @@ pub struct Ctx<'a> {
     pub signals: &'a [Signal],
     pub rejections: &'a [Rejection],
     pub orphan_sidecars: &'a [String],
+    /// `core/reference-broken` setting `ignored-references`: (type, value).
+    pub ignored_references: &'a [(String, String)],
 }
 
 const RESERVED_PENALTY: f64 = 0.9;
@@ -162,10 +164,33 @@ fn is_suppressed(ctx: &Ctx, node_path: &str, analyzer: &str, value: &str) -> boo
     })
 }
 
+/// `matchesIgnoredReference`: literal (exact), regex (unanchored,
+/// case-sensitive) or glob (`.skillmapignore` semantics).
+fn ignored_reference(entries: &[(String, String)], target: &str) -> bool {
+    let mut globs = ignore::gitignore::GitignoreBuilder::new("/");
+    let mut any_glob = false;
+    for (kind, value) in entries.iter().filter(|(_, v)| !v.is_empty()) {
+        match kind.as_str() {
+            "literal" if value == target => return true,
+            "regex" if fancy_regex::Regex::new(value).is_ok_and(|re| re.is_match(target).unwrap_or(false)) => return true,
+            "glob" => any_glob |= globs.add_line(None, value).is_ok(),
+            _ => {}
+        }
+    }
+    let t = target.strip_prefix("./").unwrap_or(target);
+    if !any_glob || t.is_empty() || t.starts_with('/') {
+        return false;
+    }
+    globs.build().is_ok_and(|g| g.matched_path_or_any_parents(t, false).is_ignore())
+}
+
 fn reference_broken(ctx: &Ctx, deltas: &mut [f64]) -> Vec<Issue> {
     let mut issues = Vec::new();
     for (i, link) in ctx.links.iter().enumerate() {
-        if !ctx.broken.contains(&i) || is_suppressed(ctx, &link.source, "reference-broken", &link.target) {
+        if !ctx.broken.contains(&i)
+            || ignored_reference(ctx.ignored_references, &link.target)
+            || is_suppressed(ctx, &link.source, "reference-broken", &link.target)
+        {
             continue;
         }
         deltas[i] -= BROKEN_PENALTY;

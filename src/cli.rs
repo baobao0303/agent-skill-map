@@ -405,6 +405,16 @@ fn scan_opts(scope: &Scope, lens: String, tokenize: bool, max_scan: Option<u64>,
         tokenize,
         follow_external_symlinks: false,
         changed: None,
+        ignored_references: settings
+            .get("plugins")
+            .and_then(|p| p.pointer("/core/extensions/reference-broken/settings/ignored-references"))
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| Some((e.get("type")?.as_str()?.to_string(), e.get("value")?.as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 

@@ -24,11 +24,15 @@ mod validate;
 mod walk;
 
 use clap::Parser;
+use clap::error::{ContextKind, ContextValue, ErrorKind};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let started = std::time::Instant::now();
-    let cli = cli::Cli::parse();
+    let cli = match cli::Cli::try_parse() {
+        Ok(c) => c,
+        Err(e) => return parse_error(e),
+    };
     let code = match cli::dispatch(&cli) {
         Ok(code) => code,
         Err(e) => {
@@ -47,4 +51,24 @@ fn main() -> ExitCode {
         eprint!("\ndone in {}\n", cli::format_elapsed(started.elapsed().as_millis() as u64));
     }
     ExitCode::from(code)
+}
+
+/// Unknown verbs / options are reported in the original's words (exit 2);
+/// help and version requests keep clap's own rendering.
+fn parse_error(e: clap::Error) -> ExitCode {
+    let arg = match e.get(ContextKind::InvalidArg).or_else(|| e.get(ContextKind::InvalidSubcommand)) {
+        Some(ContextValue::String(s)) => s.split_whitespace().next().unwrap_or("").to_string(),
+        _ => String::new(),
+    };
+    let verb = std::env::args().skip(1).find(|a| !a.starts_with('-'));
+    match e.kind() {
+        ErrorKind::UnknownArgument => match verb {
+            Some(v) => eprintln!("sm: {v}: unknown option '{arg}'"),
+            None => eprintln!("sm: unknown option '{arg}'"),
+        },
+        ErrorKind::InvalidSubcommand => eprintln!("sm: unknown command '{arg}'"),
+        _ => e.exit(),
+    }
+    eprintln!("Run 'sm help' to see the full command list.");
+    ExitCode::from(2)
 }
