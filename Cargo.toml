@@ -1,12 +1,19 @@
 [package]
-name = "skflow"
+name = "agent-skill-map"
 version = "0.1.0"
 edition = "2024"
+
+[[bin]]
+name = "asm"
+path = "src/main.rs"
+
+[[bin]]
+name = "agent-skill-map"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
 fancy-regex = "0.20.2"
-gray_matter = "0.3.2"
 hex = "0.4.3"
 ignore = "0.4.34"
 pulldown-cmark = "0.13.6"
@@ -15,13 +22,13 @@ rusqlite = { version = "0.42.0", features = ["bundled"] }
 ryu-js = "1.0.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
-serde_yaml_ng = "0.10.0"
 sha2 = "0.11.1"
 tiktoken-rs = "0.12.1"
 time = "0.3.55"
 toml = "1.2.1"
 unicode-general-category = "1.1.0"
 unicode-normalization = "0.1.26"
+yaml-rust2 = "0.10.4"
 
 [dev-dependencies]
 tempfile = "3.27.0"
