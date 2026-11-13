@@ -37,7 +37,7 @@ fn sha256_hex(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
 }
 
-fn now_ms() -> i64 {
+pub fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
@@ -365,7 +365,7 @@ pub fn run_incremental(opts: &ScanOpts, prior: Option<&ScanResult>, prior_runs: 
     recompute_counts(&mut nodes, &links, &external, &cached_paths);
 
     let mut issues = kernel_issues;
-    let orphans = orphan_sidecars(root, &ignore);
+    let orphans = orphan_sidecars(root, Some(&ignore));
     issues.extend(analyze::run(analyze::Ctx {
         nodes: &nodes,
         links: &mut links,
@@ -769,8 +769,11 @@ fn mcp_descriptor(server: &str, raw: &Value) -> Map<String, Value> {
 
 /// `.sm` files with neither a sibling `<stem>` nor `<stem>.md` file
 /// (`discover-orphans.ts`): depth-first, byte-ordered, ignore-filtered.
-fn orphan_sidecars(root: &Path, ignore: &ignore::gitignore::Gitignore) -> Vec<String> {
-    fn visit(root: &Path, dir: &Path, ignore: &ignore::gitignore::Gitignore, out: &mut Vec<String>) {
+/// `.sm` files whose `<stem>` / `<stem>.md` sibling is missing, as root-relative
+/// paths in walk order. `ignore` = the scan's ignore chain (`None` walks
+/// everything, as `sm sidecars prune` does).
+pub fn orphan_sidecars(root: &Path, ignore: Option<&ignore::gitignore::Gitignore>) -> Vec<String> {
+    fn visit(root: &Path, dir: &Path, ignore: Option<&ignore::gitignore::Gitignore>, out: &mut Vec<String>) {
         let Ok(read) = std::fs::read_dir(dir) else { return };
         let mut entries: Vec<_> = read.filter_map(Result::ok).collect();
         entries.sort_by(|a, b| a.file_name().as_encoded_bytes().cmp(b.file_name().as_encoded_bytes()));
@@ -778,7 +781,7 @@ fn orphan_sidecars(root: &Path, ignore: &ignore::gitignore::Gitignore) -> Vec<St
             let full = e.path();
             let rel = full.strip_prefix(root).unwrap_or(&full).to_string_lossy().replace('\\', "/");
             let Ok(ft) = e.file_type() else { continue };
-            if ft.is_symlink() || ignore.matched_path_or_any_parents(&rel, ft.is_dir()).is_ignore() {
+            if ft.is_symlink() || ignore.is_some_and(|ig| ig.matched_path_or_any_parents(&rel, ft.is_dir()).is_ignore()) {
                 continue;
             }
             if ft.is_dir() {

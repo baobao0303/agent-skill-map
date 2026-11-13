@@ -36,3 +36,13 @@ REA (`rea/compare.sh`) on second scans (the cache-hit path): `check` terminal un
 Incremental semantics ported from the original, including its quirks: a cache-hit node reuses its prior links verbatim, so a link resolved against a since-deleted node keeps its stale `resolvedTarget` (lift never clears one); reused nodes and links keep the DB read-back key order; untouched files (same mtime) are claimed by their prior owner inside the current provider's walk; watcher batches walk only the changed paths and then re-inject the remaining prior nodes in prior order.
 
 Not ported: the partial cache hit (some but not all of a node's extractors still valid) re-extracts the node fully; it arises only when one extractor's settings change.
+
+# P3 differential verification (sidecar writes, issue suppressions)
+
+| Scenario | Steps | Result |
+|---|---|---|
+| `bump.sh` (example): flag mutexes, disabled extension, unknown node, consent refusal, `--yes`, fresh refusal, `--force`, `--json`, `--pending`, `--pending --json`, `--staged` outside git | 18 | identical transcript incl. `.sm` bytes (timestamps masked) and 0600 modes |
+| `sidecars.sh` (example): `refresh` / `annotate` / `prune` incl. consent, `--force`, `--json`, dry-run, non-TTY confirm | 16 | identical |
+| `issues.sh` (claude-coverage): `dismiss` / `undismiss` / `suppressions`, unknown analyzer, missing node, consent, notes, duplicates, `check` after dismissal, rescan, operations.log entries | 18 | identical |
+
+The consent grant (`scope.lock.json`, sha256 over the `.skill-map/` inode and birth time) is interoperable: a grant minted by `sm` is accepted by `asm` in the same checkout.

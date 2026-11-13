@@ -11,6 +11,7 @@ path = "src/main.rs"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 ctrlc = "3.5.2"
 fancy-regex = "0.20.2"
+getrandom = "0.3"
 hex = "0.4.3"
 icu_collator = "2.4.0"
 ignore = "0.4.34"

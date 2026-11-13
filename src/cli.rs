@@ -78,6 +78,32 @@ pub enum Command {
         #[arg(long, default_value_t = 5)]
         max_consecutive_failures: u32,
     },
+    /// Bump a node's sidecar: increment annotations.version, refresh hashes, stamp audit.
+    Bump {
+        node: Option<String>,
+        /// Bump every node whose sidecar reports drift.
+        #[arg(long)]
+        pending: bool,
+        /// After each successful --pending bump, `git add` the .sm file.
+        #[arg(long)]
+        staged: bool,
+        /// Bump even when the node is fresh.
+        #[arg(long)]
+        force: bool,
+        /// Confirm writing .sm sidecar files in this project.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Sidecar (.sm) maintenance verbs.
+    Sidecars {
+        #[command(subcommand)]
+        command: SidecarsCommand,
+    },
+    /// Durable per-node issue suppressions.
+    Issues {
+        #[command(subcommand)]
+        command: IssuesCommand,
+    },
     /// Print the current issues from the database.
     Check {
         /// Restrict to issues of this node.
@@ -96,10 +122,67 @@ pub enum Command {
     },
 }
 
+#[derive(Subcommand)]
+pub enum SidecarsCommand {
+    /// Refresh a sidecar's identity hashes to match the live node (no version bump).
+    Refresh {
+        node: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Delete orphan .sm files (sidecars whose .md no longer exists).
+    Prune {
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long, alias = "force")]
+        yes: bool,
+    },
+    /// Scaffold an empty `<basename>.sm` next to a node.
+    Annotate {
+        node: String,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum IssuesCommand {
+    /// Dismiss a deterministic analyzer issue (analyzer + exact value) on one node, durably.
+    Dismiss {
+        analyzer: String,
+        value: String,
+        #[arg(short = 'n', long = "node")]
+        node: String,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Remove an issue suppression written by dismiss.
+    Undismiss {
+        analyzer: String,
+        value: String,
+        #[arg(short = 'n', long = "node")]
+        node: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// List active issue suppressions.
+    Suppressions {
+        #[arg(short = 'n', long = "node")]
+        node: Option<String>,
+    },
+}
+
 pub enum CliError {
     Usage(String),
     NotFound(String),
     Operational(String),
+    /// Printed verbatim (no glyph prefix) with this exit code.
+    Raw(String, u8),
 }
 
 impl CliError {
@@ -107,12 +190,13 @@ impl CliError {
         match self {
             CliError::Usage(_) | CliError::Operational(_) => 2,
             CliError::NotFound(_) => 5,
+            CliError::Raw(_, code) => *code,
         }
     }
 
     pub fn message(&self) -> &str {
         match self {
-            CliError::Usage(m) | CliError::NotFound(m) | CliError::Operational(m) => m,
+            CliError::Usage(m) | CliError::NotFound(m) | CliError::Operational(m) | CliError::Raw(m, _) => m,
         }
     }
 }
@@ -149,6 +233,33 @@ pub fn dispatch(cli: &Cli) -> Result<u8, CliError> {
             run_watch(cli, &scope, !no_tokens, *max_scan, *max_nodes, *max_consecutive_failures)
         }
         Command::Check { node } => check(cli, &scope, node.as_deref()),
+        Command::Issues { command } => {
+            use crate::issues::{self, Target};
+            let db = db_path(cli, &scope);
+            match command {
+                IssuesCommand::Dismiss { analyzer, value, node, note, yes } => {
+                    issues::dismiss(cli, &scope, &db, Target { analyzer, value, node, yes: *yes }, note.as_deref())
+                }
+                IssuesCommand::Undismiss { analyzer, value, node, yes } => {
+                    issues::undismiss(cli, &scope, &db, Target { analyzer, value, node, yes: *yes })
+                }
+                IssuesCommand::Suppressions { node } => issues::suppressions(cli, &db, node.as_deref()),
+            }
+        }
+        Command::Sidecars { command } => {
+            let db = db_path(cli, &scope);
+            match command {
+                SidecarsCommand::Refresh { node, yes } => crate::sidecars::refresh(cli, &scope, &db, node, *yes),
+                SidecarsCommand::Prune { dry_run, yes } => crate::sidecars::prune(cli, &scope, *dry_run, *yes),
+                SidecarsCommand::Annotate { node, force, yes } => crate::sidecars::annotate(cli, &scope, &db, node, *force, *yes),
+            }
+        }
+        Command::Bump { node, pending, staged, force, yes } => crate::bump::run(
+            cli,
+            &scope,
+            &db_path(cli, &scope),
+            crate::bump::Args { node: node.as_deref(), pending: *pending, staged: *staged, force: *force, yes: *yes },
+        ),
         Command::List { kind } => list(cli, &scope, kind.as_deref()),
         Command::Graph { format } => graph(cli, &scope, format),
     }

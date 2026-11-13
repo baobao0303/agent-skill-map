@@ -156,6 +156,41 @@ pub fn load_extractor_runs(conn: &Connection) -> rusqlite::Result<crate::scan::P
     Ok(out)
 }
 
+/// Write-through mirror of a node's sidecar annotations.
+pub fn update_node_annotations(conn: &Connection, path: &str, annotations: Option<&Value>) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE scan_nodes SET annotations_json = ?1 WHERE path = ?2",
+        params![annotations.map(crate::jsjson::to_string), path],
+    )?;
+    Ok(())
+}
+
+/// Delete the persisted issues an issue suppression silences: same analyzer
+/// (qualified filter or bare), `data.target == value`, flagged on `node`.
+pub fn delete_issues_for_suppression(conn: &Connection, node: &str, analyzer: &str, value: &str) -> rusqlite::Result<usize> {
+    let mut st = conn.prepare("SELECT id, analyzer_id, node_ids_json, data_json FROM scan_issues ORDER BY id")?;
+    let rows: Vec<(i64, String, String, Option<String>)> =
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_, _>>()?;
+    let bare = analyzer.split_once('/').map_or(analyzer, |(_, b)| b);
+    let mut deleted = 0;
+    for (id, aid, ids, data) in rows {
+        if aid != analyzer && aid != bare {
+            continue;
+        }
+        let data: Value = data.and_then(|d| serde_json::from_str(&d).ok()).unwrap_or(Value::Null);
+        if data.get("target").and_then(Value::as_str) != Some(value) {
+            continue;
+        }
+        let ids: Vec<String> = serde_json::from_str(&ids).unwrap_or_default();
+        if !ids.iter().any(|i| i == node) {
+            continue;
+        }
+        conn.execute("DELETE FROM scan_issues WHERE id = ?1", [id])?;
+        deleted += 1;
+    }
+    Ok(deleted)
+}
+
 /// Rows currently in the scan zone (the zero-result wipe guard).
 pub fn count_scan_rows(conn: &Connection) -> rusqlite::Result<u64> {
     let mut total = 0u64;

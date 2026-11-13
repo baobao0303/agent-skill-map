@@ -1,10 +1,12 @@
 mod analyze;
+mod bump;
 mod canon_yaml;
 mod cli;
 mod diagnose;
 mod extract;
 mod format;
 mod frontmatter;
+mod issues;
 mod jsjson;
 mod mask;
 mod model;
@@ -13,6 +15,8 @@ mod provider;
 mod resolve;
 mod scan;
 mod scope;
+mod sidecar;
+mod sidecars;
 mod store;
 mod tokens;
 mod validate;
@@ -27,7 +31,10 @@ fn main() -> ExitCode {
     let code = match cli::dispatch(&cli) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("✕  {}", e.message());
+            match &e {
+                cli::CliError::Raw(m, _) => eprintln!("{m}"),
+                _ => eprintln!("✕  {}", e.message()),
+            }
             e.exit_code()
         }
     };
