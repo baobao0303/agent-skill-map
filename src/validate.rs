@@ -30,6 +30,9 @@ static REGISTRY: LazyLock<HashMap<String, Value>> = LazyLock::new(|| {
         "markdown-markdown.schema.json",
         "opencode-agent.schema.json",
         "opencode-command.schema.json",
+        "../spec/report-base.schema.json",
+        "../spec/summaries/markdown.schema.json",
+        "../spec/findings/report.schema.json",
     ]
     .iter()
     .map(|text| {
@@ -72,6 +75,15 @@ pub fn errors(schema_id: &str, data: &Value) -> Vec<(String, String)> {
     out
 }
 
+/// Validate `data` against an extension's own report schema (not a registry
+/// entry); its `$ref`s resolve against the registry.
+pub fn validate_schema(schema: &Value, data: &Value) -> Vec<(String, String)> {
+    let base = schema.get("$id").and_then(Value::as_str).unwrap_or("");
+    let mut out = Vec::new();
+    eval(schema, base, data, "", &mut out);
+    out
+}
+
 /// skill-map's `formatAjvErrors`: group by path (first seen), dedupe, join.
 pub fn format(errors: &[(String, String)]) -> String {
     let mut paths: Vec<&str> = Vec::new();
@@ -110,10 +122,29 @@ fn join_id(base: &str, reference: &str) -> String {
     if reference.contains("://") {
         return reference.to_string();
     }
-    match base.rfind('/') {
+    let joined = match base.rfind('/') {
         Some(i) => format!("{}/{}", &base[..i], reference),
         None => reference.to_string(),
+    };
+    normalize_url(&joined)
+}
+
+/// Collapse `.` / `..` segments of an absolute `scheme://host/path` id, so
+/// `spec/v1/findings/../report-base.schema.json` finds its registry entry.
+fn normalize_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else { return url.to_string() };
+    let Some((host, path)) = rest.split_once('/') else { return url.to_string() };
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
     }
+    format!("{scheme}://{host}/{}", parts.join("/"))
 }
 
 fn type_name(v: &Value) -> &'static str {

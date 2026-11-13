@@ -8,6 +8,12 @@
 - Release: `cargo build --release`
 - Test: `cargo test`
 - Lint: `cargo clippy`
+- Spec conformance (original runner vs this binary): `node conformance/run-spec.mjs asm [case-id]` (`sm` for the oracle)
+- Differential scenarios: `conformance/scenarios/<name>.sh <sm|asm> <workdir>`
+- Oracle: `sm` 1.12.7 installed (gitignored) under `oracle/node_modules`; never modify it.
+
+## Status
+Port of `crystian/skill-map` to Rust. P1–P3 done and byte-compared; P4 partial (agent + jobs). Remaining work, known divergences and where to look in the oracle bundle: `spec_rust.md` §18.
 
 ## Coding Standards
 - Zero unrequested abstractions.

@@ -457,3 +457,60 @@ Mapping cột ↔ struct: `spec_doc.md` Phụ lục A; JSON lưu dạng `TEXT` (
 | 2 | `filesWalked = 16` đếm những gì (fixture có 8 `.md` + 5 `.sm` + 3 `.json`; 8 node thật + 1 node ảo)? | cần thêm fixture nhỏ để xác định |
 | 3 | Danh sách ignore mặc định chính xác | đọc từ bundle trước khi viết `walk.rs` |
 | 4 | Token count `tiktoken-rs` vs `gpt-tokenizer` có lệch không | so trên fixture; nếu lệch phải port bảng BPE |
+
+---
+
+## 18. Trạng thái tại `f1c042a`+ và việc còn lại (cập nhật 2026-11-13)
+
+### 18.1 Đã xong (đã kiểm differential với `sm` 1.12.7)
+
+| Pha | Nội dung | Bằng chứng |
+|---|---|---|
+| P1 | scan / check / list / graph ×4, store SQLite, formatters | `rea/compare/SUMMARY.md` (REA 27/31, phần còn lại chỉ khác chia frame PTY / BOM) |
+| P2 | cache tăng dần theo node (mtime gate, `scan_extractor_runs`), rename high/medium/ambiguous, orphan, migrate `state_*`, `scan --full/--changed/--allow-empty/--watch`, `watch` | `conformance/scenarios/renames.sh`, `watch.sh` — byte-identical |
+| P3 | `bump`, `sidecars refresh/annotate/prune`, `issues dismiss/undismiss/suppressions`, `orphans` / `reconcile` / `undo-rename`, consent gate (`scope.lock.json`, tương thích grant của `sm`) | `conformance/scenarios/{bump,sidecars,issues,orphans}.sh` — giống hệt |
+| P4 (một phần) | `agent install/uninstall/status`; `jobs submit/list/show/preview/claim/status/cancel/fail`; catalog extension (`src/schema/catalog.json` trích bằng `tools/extract-catalog.mjs`) | bộ conformance spec: **asm 24/51** (`node conformance/run-spec.mjs asm`), `sm` 51/51 |
+
+### 18.2 P4 — còn dở
+
+- **`record`** (chưa có): kiểm nonce (exit 4), validate report theo schema của extension (fail `report-invalid`), ghi `state_executions`, write-through `state_summaries` / `state_findings` / tags, envelope ndjson `--json` (`run.started` …). Nền đã có: `validate::validate_schema` + registry các schema spec (`report-base`, `summaries/markdown`, `findings/report`) — commit WIP sau `f1c042a`. Nguồn gốc: `RecordCommand`, `RECORD_TEXTS` (dist/cli.js ~18883), `recordJobTerminal`, `insertExecution`, `upsertSummaryForNode`, `writeFindingsForNode` (dist/sqlite-*.js).
+- **`findings`** (list + `resolve/reopen/dismiss/undismiss/suppressions/prune/clear`).
+- **`history`**, **`history stats`**.
+- Fixer jobs: mục `## Findings to resolve` / `## Issues to resolve`, `--finding`, supersede job queued, `--auto-fix`; `jobs prune`; tự gỡ suppression khi submit finder; job `skill:`; đẩy `job.*` lên server (`pushJobEvent`, cần P5).
+- Case conformance đang trượt vì phần này: `history-record-schema`, `history-stats-schema`, `record-findings-envelope-gate`, `record-findings-report`, `record-nonce-mismatch`, `record-report-schema-gate`, `record-run-envelope`, `record-tags-report` (cần thêm `plugins enable`).
+
+### 18.3 P5 — server (chưa làm)
+
+- `serve`: HTTP BFF (route REST, envelope `rest-envelope.schema.json`), WebSocket, file `.skill-map/serve.json` (`serve-info.schema.json`), nhận `POST /api/job-events`.
+- MCP server (`spec/mcp-server.md`).
+- Chạy giao diện Angular gốc (`oracle/.../cli/dist/ui`) trên server Rust (axum + tokio, chỉ đưa tokio vào ở pha này).
+- Case: `rest-envelope-schema`, `serve-info-schema`, `skill-actions-catalog`.
+
+### 18.4 P6 — plugin và activity (chưa làm)
+
+- Chạy thật plugin JS drop-in (hiện `catalog.rs` chỉ đọc theo quy ước `prompt.md` + `report.schema.json`), kiểm manifest, slot/contribution UI.
+- `plugins list/show/doctor/enable/disable/trust/untrust/create/slots/upgrade/config`.
+- `activity install/uninstall/status`, analyzer `observed-*`, `enrich`.
+- Case: `score-phase-confidence`, `plugin-*`, `view-*`, `extension-*-manifests`, `extension-manifest-enable-gate`, `catalog-slots-input-types`, `enrich-report-schema`, `github-enrichment-recorded`.
+
+### 18.5 Lệnh khác chưa có
+
+`config list/get/show/set/reset`, `init`, `doctor`, `show`, `export`, `db backup/restore/reset/shell/dump/migrate`, `scan compare-with`, `actions list/show`, `hooks install`, `conformance run`, `help` (theo định dạng gốc), `tutorial`, `example`. Case liên quan: `project-config-schema`, `conformance-result-schema`, `elapsed-time-reporting`.
+
+### 18.6 Lệch đã biết so với bản gốc
+
+- Đếm token file có BOM lệch 1 (tiktoken-rs không coi U+FEFF là khoảng trắng).
+- Key YAML > 1024 ký tự; cách viết một số lỗi YAML ngoài trường hợp dấu `:` không quote.
+- Analyzer `schema-violation` (và `observed-*`) chưa port.
+- Cache: khi chỉ một extractor đổi setting (partial hit), `asm` chạy lại cả node.
+- Chưa tự dựng lại DB khi schema fingerprint lệch (`rebuildOnDrift`).
+- Chưa thử câu hỏi xác nhận ở TTY thật (mới kiểm đường non-TTY).
+
+### 18.7 Cách kiểm khi làm tiếp
+
+```bash
+cargo build --release && cargo test --release
+node conformance/run-spec.mjs asm            # cả bộ; thêm <case-id> để chạy riêng
+node conformance/run-spec.mjs sm <case-id>   # xem bản gốc pass
+conformance/scenarios/<name>.sh <sm|asm> <workdir>   # differential từng nhóm verb
+```

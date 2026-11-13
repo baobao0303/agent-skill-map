@@ -592,7 +592,7 @@ pub fn list(cli: &Cli, db: &Path, status: Option<&str>, extension: Option<&str>,
     Ok(0)
 }
 
-fn iso(ms: Option<i64>) -> String {
+pub fn iso(ms: Option<i64>) -> String {
     let Some(ms) = ms else { return "(none)".into() };
     let t = time::OffsetDateTime::from_unix_timestamp_nanos(ms as i128 * 1_000_000).unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
     format!(
