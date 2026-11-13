@@ -1,0 +1,6 @@
+name = "builder"
+description = "Builds things"
+developer_instructions = """
+Use $check-links then $missing-skill. Read @docs/guide.md and @./notes.md.
+Shell vars like $path and $HOME are not skills. Also /help is not a codex command.
+"""

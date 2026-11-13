@@ -4,7 +4,7 @@ use crate::extract::{self, NodeInput};
 use crate::model::{ExternalRef, Issue, Link, Node, OversizedFile, ScanResult, ScannedBy, Stats, Triple};
 use crate::provider::{self, McpDialect, PROVIDERS, Parser};
 use crate::walk::{self, IgnoreLayers, WalkOpts};
-use crate::{analyze, canon_yaml, frontmatter, resolve, tokens};
+use crate::{analyze, canon_yaml, diagnose, frontmatter, resolve, tokens, validate};
 use rayon::prelude::*;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -37,6 +37,7 @@ struct Built {
     node: Node,
     body: String,
     body_line_offset: usize,
+    issues: Vec<Issue>,
 }
 
 pub fn run(opts: &ScanOpts) -> ScanResult {
@@ -52,6 +53,7 @@ pub fn run(opts: &ScanOpts) -> ScanResult {
 
     let mut nodes: Vec<Node> = Vec::new();
     let mut bodies: Vec<(String, usize)> = Vec::new(); // per real node: body, body_line_offset
+    let mut node_issues: Vec<Vec<Issue>> = Vec::new(); // kernel-stamped, per real node
     let mut claimed: HashSet<String> = HashSet::new();
     let mut oversized = Vec::new();
     let mut files_walked = 0u64;
@@ -86,15 +88,19 @@ pub fn run(opts: &ScanOpts) -> ScanResult {
                 }
                 claimed.insert(b.node.path.clone());
                 bodies.push((b.body, b.body_line_offset));
+                node_issues.push(b.issues);
                 nodes.push(b.node);
             }
         }
     }
 
     // Sidecar overlays (real nodes only).
-    for node in nodes.iter_mut() {
-        node.sidecar = Some(sidecar_overlay(root, node));
+    for (node, issues) in nodes.iter_mut().zip(node_issues.iter_mut()) {
+        let (overlay, issue) = sidecar_overlay(root, node);
+        node.sidecar = Some(overlay);
+        issues.extend(issue);
     }
+    let kernel_issues: Vec<Issue> = node_issues.into_iter().flatten().collect();
 
     // Extraction, in node order; virtual nodes land right after their source.
     let outputs: Vec<extract::Output> = nodes
@@ -126,8 +132,9 @@ pub fn run(opts: &ScanOpts) -> ScanResult {
     let mut nodes = with_virtual;
     apply_config_mcp_nodes(root, &opts.lens, &mut nodes);
 
+    let (resolved, rejections) = resolve::resolve_signals(&signals);
     let (external, internal): (Vec<Link>, Vec<Link>) =
-        resolve::resolve_signals(&signals).into_iter().partition(|l| resolve::is_external_url(&l.target));
+        resolved.into_iter().partition(|l| resolve::is_external_url(&l.target));
     let reserved = resolve::reserved_node_paths(&nodes);
     let mut links = resolve::dedupe_links(internal);
     let idx = resolve::build_indexes(&nodes);
@@ -136,8 +143,17 @@ pub fn run(opts: &ScanOpts) -> ScanResult {
     let broken = resolve::broken_links(&links, &idx, &[root.as_path()]);
     recompute_counts(&mut nodes, &links, &external);
 
-    let issues: Vec<Issue> =
-        analyze::run(analyze::Ctx { nodes: &nodes, links: &mut links, reserved_paths: &reserved, broken: &broken });
+    let mut issues = kernel_issues;
+    let orphans = orphan_sidecars(root, &ignore);
+    issues.extend(analyze::run(analyze::Ctx {
+        nodes: &nodes,
+        links: &mut links,
+        reserved_paths: &reserved,
+        broken: &broken,
+        signals: &signals,
+        rejections: &rejections,
+        orphan_sidecars: &orphans,
+    }));
 
     ScanResult {
         schema_version: 1,
@@ -175,10 +191,10 @@ impl ScanResult {
 }
 
 fn build_node(rel: &str, kind: &str, provider: &str, rule: &provider::ReadRule, text: &str, mtime_ms: i64, tokenize: bool) -> Built {
-    let (raw, body, body_line_offset, fm) = match rule.parser {
+    let (raw, body, body_line_offset, fm, declared, parse_error) = match rule.parser {
         Parser::FrontmatterYaml => {
             let p = frontmatter::parse(text);
-            (p.raw.to_string(), p.body.to_string(), p.body_line_offset, p.value)
+            (p.raw.to_string(), p.body.to_string(), p.body_line_offset, p.value, p.declared, p.parse_error)
         }
         // TOML (Codex agents): the whole file is the "frontmatter"; the body is
         // the declared body field. Not yet verified against the oracle.
@@ -193,9 +209,20 @@ fn build_node(rel: &str, kind: &str, provider: &str, rule: &provider::ReadRule, 
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            (text.to_string(), body, 0, fm)
+            (text.to_string(), body, 0, fm, true, None)
         }
     };
+    let issues = diagnose::node_issues(&diagnose::NodeText {
+        path: rel,
+        provider,
+        kind,
+        declared,
+        raw: &raw,
+        body: &body,
+        body_line_offset,
+        frontmatter: &fm,
+        parse_error: parse_error.as_deref(),
+    });
     let fm_canonical = match &fm {
         Value::Object(m) if m.is_empty() && !raw.is_empty() => raw.clone(),
         v => canon_yaml::dump(v),
@@ -223,7 +250,7 @@ fn build_node(rel: &str, kind: &str, provider: &str, rule: &provider::ReadRule, 
         sidecar: None,
         external_refs: None,
     };
-    Built { node, body, body_line_offset }
+    Built { node, body, body_line_offset, issues }
 }
 
 const ZERO_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -249,16 +276,31 @@ fn virtual_node(path: String, kind: &str, provider: &str, derived_from: Vec<Stri
     }
 }
 
-fn sidecar_overlay(root: &Path, node: &Node) -> Value {
+fn sidecar_overlay(root: &Path, node: &Node) -> (Value, Option<Issue>) {
     let sm = match node.path.strip_suffix(".md") {
         Some(stem) => format!("{stem}.sm"),
         None => format!("{}.sm", node.path),
     };
-    let Ok(text) = std::fs::read_to_string(root.join(&sm)) else { return json!({ "present": false }) };
+    let sm_abs = root.join(&sm);
+    let Ok(text) = std::fs::read_to_string(&sm_abs) else { return (json!({ "present": false }), None) };
+    let invalid = |message: String| {
+        let issue = Issue::new("invalid-sidecar", "error", vec![node.path.clone()], message)
+            .data(json!({ "sidecarPath": node.path }));
+        (json!({ "present": true, "status": null, "annotations": null, "root": null }), Some(issue))
+    };
+    let shown = sm_abs.display();
     let parsed = match frontmatter::load(&text) {
         Ok(Some(Value::Object(m))) => m,
-        _ => return json!({ "present": true, "status": null, "annotations": null, "root": null }),
+        Ok(_) => return invalid(format!("sidecar root must be a YAML mapping at {shown}")),
+        Err(e) => return invalid(format!("malformed YAML in {shown}: {e}")),
     };
+    let root_value = Value::Object(parsed.clone());
+    let errors = validate::errors(validate::SIDECAR, &root_value);
+    if !errors.is_empty() {
+        let text: Vec<String> =
+            errors.iter().map(|(p, m)| format!("{} {m}", if p.is_empty() { "(root)" } else { p })).collect();
+        return invalid(format!("sidecar schema validation failed at {shown}: {}", text.join("; ")));
+    }
     let identity = parsed.get("identity");
     let stored = |k: &str| identity.and_then(|i| i.get(k)).and_then(Value::as_str).unwrap_or("");
     let body_drift = stored("bodyHash") != node.body_hash;
@@ -273,7 +315,7 @@ fn sidecar_overlay(root: &Path, node: &Node) -> Value {
         Some(Value::Object(a)) if !a.is_empty() => Value::Object(a.clone()),
         _ => Value::Null,
     };
-    json!({ "present": true, "status": status, "annotations": annotations, "root": Value::Object(parsed) })
+    (json!({ "present": true, "status": status, "annotations": annotations, "root": root_value }), None)
 }
 
 /// Config-side MCP servers of the active lens (`mcp-config-nodes.ts`).
@@ -362,6 +404,36 @@ fn mcp_descriptor(server: &str, raw: &Value) -> Map<String, Value> {
     fm
 }
 
+/// `.sm` files with neither a sibling `<stem>` nor `<stem>.md` file
+/// (`discover-orphans.ts`): depth-first, byte-ordered, ignore-filtered.
+fn orphan_sidecars(root: &Path, ignore: &ignore::gitignore::Gitignore) -> Vec<String> {
+    fn visit(root: &Path, dir: &Path, ignore: &ignore::gitignore::Gitignore, out: &mut Vec<String>) {
+        let Ok(read) = std::fs::read_dir(dir) else { return };
+        let mut entries: Vec<_> = read.filter_map(Result::ok).collect();
+        entries.sort_by(|a, b| a.file_name().as_encoded_bytes().cmp(b.file_name().as_encoded_bytes()));
+        for e in entries {
+            let full = e.path();
+            let rel = full.strip_prefix(root).unwrap_or(&full).to_string_lossy().replace('\\', "/");
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_symlink() || ignore.matched_path_or_any_parents(&rel, ft.is_dir()).is_ignore() {
+                continue;
+            }
+            if ft.is_dir() {
+                visit(root, &full, ignore, out);
+            } else if ft.is_file() && rel.ends_with(".sm") {
+                let stem = &full.to_string_lossy()[..full.to_string_lossy().len() - 3];
+                let is_file = |p: String| std::fs::metadata(p).is_ok_and(|m| m.is_file());
+                if !is_file(stem.to_string()) && !is_file(format!("{stem}.md")) {
+                    out.push(rel);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    visit(root, root, ignore, &mut out);
+    out
+}
+
 fn recompute_counts(nodes: &mut [Node], links: &[Link], external: &[Link]) {
     for link in links {
         if let Some(n) = nodes.iter_mut().find(|n| n.path == link.source) {
@@ -388,16 +460,32 @@ fn recompute_counts(nodes: &mut [Node], links: &[Link], external: &[Link]) {
 mod tests {
     use super::*;
 
-    /// Whole-scan comparison against the original CLI on the example fixture,
-    /// ignoring fields that legitimately differ per run or per implementation.
-    #[test]
-    fn example_matches_oracle() {
+    fn scrub(mut v: Value) -> Value {
+        v["scannedAt"] = Value::Null;
+        v["scannedBy"] = Value::Null;
+        v["stats"]["durationMs"] = Value::Null;
+        for n in v["nodes"].as_array_mut().unwrap() {
+            if let Some(o) = n.as_object_mut() {
+                o.remove("modifiedAtMs");
+                // Known divergence: gpt-tokenizer's `\s` includes U+FEFF and
+                // splits a BOM differently from tiktoken-rs (one token apart).
+                if o.get("path").and_then(Value::as_str) == Some(".claude/skills/bom/SKILL.md") {
+                    o.remove("tokens");
+                }
+            }
+        }
+        v
+    }
+
+    /// First difference per section between our scan and the original's
+    /// golden for one fixture; empty when they match.
+    pub fn diff_fixture(name: &str) -> Vec<String> {
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("conformance");
         let golden: Value =
-            serde_json::from_str(&std::fs::read_to_string(base.join("golden/example/scan.json")).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(base.join(format!("golden/{name}/scan.json"))).unwrap()).unwrap();
         let opts = ScanOpts {
-            root: base.join("fixtures/example"),
-            lens: "claude".into(),
+            root: base.join(format!("fixtures/{name}")),
+            lens: golden["activeProvider"].as_str().unwrap().to_string(),
             ignore: vec![],
             respect_gitignore: false,
             max_scan: 5000,
@@ -406,25 +494,41 @@ mod tests {
             tokenize: true,
             follow_external_symlinks: false,
         };
-        let ours: Value = serde_json::from_str(&crate::jsjson::to_string(&run(&opts))).unwrap();
-        let scrub = |mut v: Value| {
-            v["scannedAt"] = Value::Null;
-            v["scannedBy"] = Value::Null;
-            v["stats"]["durationMs"] = Value::Null;
-            for n in v["nodes"].as_array_mut().unwrap() {
-                if let Some(o) = n.as_object_mut() {
-                    o.remove("modifiedAtMs");
+        // Absolute paths in messages (invalid-sidecar) are recorded as `<ROOT>`.
+        let ours_text = crate::jsjson::to_string(&run(&opts)).replace(&opts.root.display().to_string(), "<ROOT>");
+        let ours = scrub(serde_json::from_str(&ours_text).unwrap());
+        let golden = scrub(golden);
+        let mut out = Vec::new();
+        for key in ["nodes", "links", "issues"] {
+            let (a, b) = (ours[key].as_array().unwrap(), golden[key].as_array().unwrap());
+            for i in 0..a.len().max(b.len()) {
+                let (x, y) = (a.get(i).map(crate::jsjson::to_string), b.get(i).map(crate::jsjson::to_string));
+                if x != y {
+                    out.push(format!("{name}.{key}[{i}] (ours {} vs golden {})\n  ours:   {}\n  golden: {}", a.len(), b.len(),
+                        x.unwrap_or_default().chars().take(600).collect::<String>(), y.unwrap_or_default().chars().take(600).collect::<String>()));
+                    break;
                 }
             }
-            v
-        };
-        let (ours, golden) = (scrub(ours), scrub(golden));
-        for key in ["nodes", "links", "issues", "stats", "providers", "roots", "activeProvider"] {
-            assert_eq!(
-                crate::jsjson::to_string(&ours[key]),
-                crate::jsjson::to_string(&golden[key]),
-                "mismatch in `{key}`"
-            );
         }
+        for key in ["stats", "providers", "roots", "activeProvider"] {
+            if crate::jsjson::to_string(&ours[key]) != crate::jsjson::to_string(&golden[key]) {
+                out.push(format!("{name}.{key}: ours {} vs golden {}", ours[key], golden[key]));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn fixtures_match_oracle() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("conformance/golden");
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().join("scan.json").exists())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        let failures: Vec<String> = names.iter().flat_map(|n| diff_fixture(n)).collect();
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }

@@ -79,29 +79,51 @@ pub const ORDER: &[&str] = &[
 pub fn run(node: &NodeInput, lens: &str) -> Output {
     let mut out = Output::default();
     let prose = mask::strip_code_and_html(node.body);
-    let ctx = Ctx { node, prose: &prose, line_starts: line_starts(&prose) };
+    let code = mask::extract_code_regions(node.body);
+    let fenced = mask::extract_fenced_regions(node.body);
+    let p = Ctx { node, text: &prose, fenced: None, line_starts: line_starts(&prose) };
+    let c = Ctx { node, text: &code, fenced: Some(&fenced), line_starts: line_starts(&code) };
+    let slash_lens = matches!(lens, "claude" | "antigravity" | "opencode");
     if lens == "claude" {
-        at_directive(&ctx, &mut out);
+        mentions(&p, "at-directive", &mut out);
+        mentions(&c, "backtick-mention", &mut out);
     }
-    external_url_counter(&ctx, &mut out);
-    markdown_link(&ctx, &mut out);
+    if lens == "codex" {
+        invocations(&c, &DOLLAR_TOKEN, "backtick-dollar", false, &mut out);
+        invocations(&p, &DOLLAR_TOKEN, "dollar-skill", false, &mut out);
+    }
+    if matches!(lens, "claude" | "codex" | "antigravity") {
+        at_file(&p, &mut out);
+    }
+    backtick_path(&c, &mut out);
+    if slash_lens {
+        invocations(&c, &SLASH_TOKEN, "backtick-slash", true, &mut out);
+    }
+    external_url_counter(&p, &mut out);
+    markdown_link(&p, &mut out);
     mcp_tools(node, &mut out);
-    if matches!(lens, "claude" | "antigravity" | "opencode") {
-        slash_command(&ctx, &mut out);
+    if slash_lens {
+        invocations(&p, &SLASH_TOKEN, "slash-command", true, &mut out);
     }
     out
 }
 
+/// One extraction domain: the prose view (code and HTML blanked) or the
+/// code view (everything outside code regions blanked). `fenced` is set for
+/// the code view and tells inline spans from fenced blocks.
 struct Ctx<'a> {
     node: &'a NodeInput<'a>,
-    prose: &'a str,
+    text: &'a str,
+    fenced: Option<&'a str>,
     line_starts: Vec<usize>,
 }
 
 impl Ctx<'_> {
     fn range(&self, byte_start: usize, byte_len: usize) -> Range {
-        let start = utf16_len(&self.prose[..byte_start]);
-        let end = start + utf16_len(&self.prose[byte_start..byte_start + byte_len]);
+        // Masks keep byte offsets but not UTF-16 widths (a blanked `Ü` is two
+        // spaces), so UTF-16 offsets are measured on the original body.
+        let start = utf16_len(&self.node.body[..byte_start]);
+        let end = start + utf16_len(&self.node.body[byte_start..byte_start + byte_len]);
         let body_line = self.line_starts.partition_point(|&s| s <= byte_start) as u64;
         Range { start, end, line: body_line + self.node.body_line_offset as u64 }
     }
@@ -112,7 +134,7 @@ impl Ctx<'_> {
             body_scope: true,
             range: Some(self.range(byte_start, raw.len())),
             raw: raw.to_string(),
-            context: None,
+            context: self.fenced.map(|f| if f.as_bytes()[byte_start] == b' ' { "inline-code" } else { "code-block" }),
             candidates: vec![candidate],
         }
     }
@@ -177,6 +199,11 @@ static FILE_EXT: LazyLock<Regex> = LazyLock::new(|| {
 static SLASH_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?<![A-Za-z0-9_/.:?#=&])(/(?=[0-9_-]*[a-z])[a-z0-9][a-z0-9_-]*(?::(?=[0-9_-]*[a-z])[a-z0-9][a-z0-9_-]*)?)").unwrap()
 });
+static DOLLAR_TOKEN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?<![A-Za-z0-9_$])(\$[a-z][a-z0-9_-]*)").unwrap());
+/// JavaScript `\w`/`\b` are ASCII-only, hence the explicit classes.
+static BACKTICK_PATH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?<![A-Za-z0-9_/:.-])(?:\.{1,2}/)*\.?[A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_.-]+)*\.md(?![A-Za-z0-9_/])").unwrap()
+});
 static MD_LINK: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?<!!)\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)"#).unwrap());
 static URL_SCHEME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^[a-z][a-z0-9+.-]*:").unwrap());
@@ -190,9 +217,10 @@ pub fn is_at_file_token(bare: &str) -> bool {
         && (bare.starts_with("./") || bare.starts_with("../") || FILE_EXT.is_match(bare).unwrap_or(false))
 }
 
-fn at_directive(ctx: &Ctx, out: &mut Output) {
+/// Bare `@handle` mentions (`at-directive` on prose, `backtick-mention` on code).
+fn mentions(ctx: &Ctx, extractor: &'static str, out: &mut Output) {
     let mut seen = HashSet::new();
-    for caps in AT_TOKEN.captures_iter(ctx.prose).flatten() {
+    for caps in AT_TOKEN.captures_iter(ctx.text).flatten() {
         let m = caps.get(1).unwrap();
         let original = m.as_str();
         let bare = &original[1..];
@@ -204,7 +232,7 @@ fn at_directive(ctx: &Ctx, out: &mut Output) {
             continue;
         }
         let candidate = Candidate {
-            extractor: "at-directive",
+            extractor,
             kind: "mentions",
             target: original.to_string(),
             confidence: 0.5,
@@ -215,13 +243,16 @@ fn at_directive(ctx: &Ctx, out: &mut Output) {
     }
 }
 
-fn slash_command(ctx: &Ctx, out: &mut Output) {
+/// `/command` and `$skill` invocations, prose or code domain.
+fn invocations(ctx: &Ctx, re: &Regex, extractor: &'static str, path_suffix_guard: bool, out: &mut Output) {
     let mut seen = HashSet::new();
-    for caps in SLASH_TOKEN.captures_iter(ctx.prose).flatten() {
+    for caps in re.captures_iter(ctx.text).flatten() {
         let m = caps.get(1).unwrap();
-        let next = ctx.prose[m.end()..].chars().next();
-        if next.is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '/' | '-')) {
-            continue;
+        if path_suffix_guard {
+            let next = ctx.text[caps.get(0).unwrap().end()..].chars().next();
+            if next.is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '/' | '-')) {
+                continue;
+            }
         }
         let original = m.as_str();
         let normalized = normalize_trigger(original);
@@ -229,7 +260,7 @@ fn slash_command(ctx: &Ctx, out: &mut Output) {
             continue;
         }
         let candidate = Candidate {
-            extractor: "slash-command",
+            extractor,
             kind: "invokes",
             target: original.to_string(),
             confidence: 0.8,
@@ -240,10 +271,65 @@ fn slash_command(ctx: &Ctx, out: &mut Output) {
     }
 }
 
+/// File-shaped `@` tokens (`@./x`, `@notes.md`) → path references.
+fn at_file(ctx: &Ctx, out: &mut Output) {
+    let mut seen = HashSet::new();
+    let source_dir = posix_dirname(ctx.node.path);
+    for caps in AT_TOKEN.captures_iter(ctx.text).flatten() {
+        let m = caps.get(1).unwrap();
+        let original = m.as_str();
+        let bare = &original[1..];
+        if !is_at_file_token(bare) {
+            continue;
+        }
+        let joined = if source_dir == "." { bare.to_string() } else { format!("{source_dir}/{bare}") };
+        let target = posix_normalize(&joined);
+        if !seen.insert(target.to_lowercase()) {
+            continue;
+        }
+        let candidate = Candidate {
+            extractor: "at-file",
+            kind: "references",
+            target: target.clone(),
+            confidence: 0.85,
+            original_trigger: original.to_string(),
+            normalized_trigger: target,
+        };
+        out.signals.push(ctx.signal(m.start(), original, candidate));
+    }
+}
+
+/// Relative `.md` paths inside code regions → `points`.
+fn backtick_path(ctx: &Ctx, out: &mut Output) {
+    let mut seen = HashSet::new();
+    let source_dir = posix_dirname(ctx.node.path);
+    for m in BACKTICK_PATH.find_iter(ctx.text).flatten() {
+        let original = m.as_str();
+        let trimmed = original.trim();
+        if trimmed.is_empty() || trimmed.starts_with('/') {
+            continue;
+        }
+        let joined = if source_dir == "." { trimmed.to_string() } else { format!("{source_dir}/{trimmed}") };
+        let resolved = posix_normalize(&joined);
+        if !seen.insert(resolved.clone()) {
+            continue;
+        }
+        let candidate = Candidate {
+            extractor: "backtick-path",
+            kind: "points",
+            target: resolved.clone(),
+            confidence: 0.85,
+            original_trigger: original.to_string(),
+            normalized_trigger: resolved,
+        };
+        out.signals.push(ctx.signal(m.start(), original, candidate));
+    }
+}
+
 fn markdown_link(ctx: &Ctx, out: &mut Output) {
     let mut seen = HashSet::new();
     let source_dir = posix_dirname(ctx.node.path);
-    for caps in MD_LINK.captures_iter(ctx.prose).flatten() {
+    for caps in MD_LINK.captures_iter(ctx.text).flatten() {
         let whole = caps.get(0).unwrap();
         let original = caps.get(2).unwrap().as_str();
         let Some(resolved) = resolve_link_target(source_dir, original) else { continue };
@@ -282,7 +368,7 @@ fn resolve_link_target(source_dir: &str, raw: &str) -> Option<String> {
 
 fn external_url_counter(ctx: &Ctx, out: &mut Output) {
     let mut seen = HashSet::new();
-    for m in URL.find_iter(ctx.prose).flatten() {
+    for m in URL.find_iter(ctx.text).flatten() {
         let original = m.as_str().trim_end_matches(['.', ',', ';', ':', '!', '?']);
         if original.is_empty() {
             continue;
@@ -363,7 +449,9 @@ mod tests {
         let fm = Value::Object(Default::default());
         let node = NodeInput { path: "a.md", provider: "claude", body: "run /deploy then @reviewer, not /api/v1 or `/code`\n", body_line_offset: 0, frontmatter: &fm };
         let out = run(&node, "claude");
-        let targets: Vec<&str> = out.signals.iter().map(|s| s.candidates[0].target.as_str()).collect();
-        assert_eq!(targets, ["@reviewer", "/deploy"]);
+        let found: Vec<(&str, Option<&str>)> =
+            out.signals.iter().map(|s| (s.candidates[0].target.as_str(), s.context)).collect();
+        // `/code` comes from backtick-slash (code region); `/api/v1` is a path, not a command.
+        assert_eq!(found, [("@reviewer", None), ("/code", Some("inline-code")), ("/deploy", None)]);
     }
 }

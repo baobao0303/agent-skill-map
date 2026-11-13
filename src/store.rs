@@ -2,7 +2,7 @@
 //! (`schema/001_initial.sql`, verbatim) so the original UI/BFF can read it.
 
 use crate::model::{
-    ExternalRef, Fix, Issue, Link, Location, Node, OccLocation, Occurrence, OversizedFile, ScanResult, ScannedBy,
+    ExternalRef, Issue, Link, Location, Node, OccLocation, Occurrence, OversizedFile, ScanResult, ScannedBy,
     Stats, Trigger, Triple,
 };
 use rusqlite::{Connection, OptionalExtension, params};
@@ -136,11 +136,20 @@ pub fn persist(conn: &mut Connection, scan: &ScanResult) -> rusqlite::Result<()>
     }
     {
         let mut ins = tx.prepare(
-            "INSERT INTO scan_issues (analyzer_id, severity, node_ids_json, message, fix_json, data_json)
-             VALUES (?1,?2,?3,?4,?5,?6)",
+            "INSERT INTO scan_issues (analyzer_id, severity, node_ids_json, message, detail, fix_json, data_json)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
         )?;
         for i in &scan.issues {
-            ins.execute(params![i.analyzer_id, i.severity, json(&i.node_ids), i.message, opt_json(&i.fix), opt_json(&i.data)])?;
+            // fix_json keeps the tail's key order so a read-back rebuilds it.
+            ins.execute(params![
+                i.analyzer_id,
+                i.severity,
+                json(&i.node_ids),
+                i.message,
+                i.get("detail").and_then(Value::as_str),
+                i.get("fix").map(|f| json(f)),
+                i.get("data").map(|d| json(d)),
+            ])?;
         }
     }
     tx.execute(
@@ -285,17 +294,20 @@ pub fn load(conn: &Connection) -> rusqlite::Result<Option<ScanResult>> {
         })?
         .collect::<rusqlite::Result<_>>()?;
 
-    let mut st = conn.prepare("SELECT analyzer_id, severity, node_ids_json, message, fix_json, data_json FROM scan_issues ORDER BY id")?;
+    let mut st = conn.prepare("SELECT analyzer_id, severity, node_ids_json, message, fix_json, data_json, detail FROM scan_issues ORDER BY id")?;
     let issues: Vec<Issue> = st
         .query_map([], |r| {
-            Ok(Issue {
-                analyzer_id: r.get(0)?,
-                severity: leak(r.get(1)?),
-                node_ids: parse(r.get(2)?).unwrap_or_default(),
-                message: r.get(3)?,
-                fix: parse::<Value>(r.get(4)?).map(|f| Fix { summary: f["summary"].as_str().unwrap_or("").into() }),
-                data: parse(r.get(5)?),
-            })
+            let mut issue = Issue::new(&r.get::<_, String>(0)?, leak(r.get(1)?), parse(r.get(2)?).unwrap_or_default(), r.get(3)?);
+            if let Some(d) = r.get::<_, Option<String>>(6)? {
+                issue = issue.detail(d);
+            }
+            if let Some(f) = parse::<Value>(r.get(4)?) {
+                issue.tail.insert("fix".into(), f);
+            }
+            if let Some(d) = parse::<Value>(r.get(5)?) {
+                issue = issue.data(d);
+            }
+            Ok(issue)
         })?
         .collect::<rusqlite::Result<_>>()?;
 

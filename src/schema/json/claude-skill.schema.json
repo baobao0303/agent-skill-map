@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skill-map.ai/providers/claude/v1/frontmatter/skill.schema.json",
+  "title": "FrontmatterSkill",
+  "description": "Frontmatter shape for nodes classified as `skill` by the Claude Provider. Today identical to `command`, both extend the shared `skill-base.schema.json` per Anthropic's documented merger (https://code.claude.com/docs/en/skills.md, \"Custom commands have been merged into skills\"). The two are kept SPLIT (not aliased) because skill-map's registry differentiates them in `IProviderKind.ui` (separate label / icon / color) and `defaultRefreshAction`. Splitting also reserves room for future divergence when one kind diverges from the other. No skill-only fields today; `additionalProperties: true` so the file is ready for them.",
+  "allOf": [
+    { "$ref": "https://skill-map.ai/providers/claude/v1/frontmatter/skill-base.schema.json" }
+  ],
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {}
+}

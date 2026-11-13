@@ -42,10 +42,6 @@ impl Scope {
         read_object(&self.dir().join("settings.json"))
     }
 
-    pub fn local_settings(&self) -> Map<String, Value> {
-        read_object(&self.dir().join("settings.local.json"))
-    }
-
     pub fn write_settings(&self, settings: &Map<String, Value>) -> std::io::Result<()> {
         let mut text = crate::jsjson::to_string_pretty(settings);
         text.push('\n');

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skill-map.ai/spec/v1/frontmatter/base.schema.json",
+  "title": "FrontmatterBase",
+  "description": "Universal frontmatter shape every Provider's per-kind schema extends via `allOf` + `$ref` to this `$id`. It DEFINES the two cross-vendor fields, `name` and `description`, but deliberately does NOT require them: whether either is mandatory is a per-kind decision. The kinds whose vendor mandates them add `required` on their own extension (Claude agent, OpenAI Codex agent, the Agent Skills skill); the generic `markdown` fallback and Claude skill/command leave them optional, because no normative Markdown standard mandates frontmatter fields and Claude's merged skill/command contract treats `name` (defaults to the directory/file name) and `description` (defaults to the first paragraph) as optional. `description` is the field every format carries and `name` is universal among formats with explicit identifiers, so both live here as shared definitions with `minLength: 1` (a present value cannot be empty). Everything else is vendor idiosyncrasy and lives on the per-vendor per-kind schema, NOT here. (Taxonomy `tags`, for example, is a skill-map concept with no vendor frontmatter analog, so it lives in the `.sm` sidecar `annotations.tags`, not here.) `additionalProperties: true` is intentional: skill-map AGGREGATES vendor specs, it does not curate them. Vendor-specific fields (`tools`, `allowedTools`, `model`, etc.) flow through validation silently because the per-kind extension declares them.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Short human-readable identifier. When present it must be non-empty; whether it is required is decided per kind (see each per-kind schema's `required`)."
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "description": "One-to-three-sentence description. When present it must be non-empty; whether it is required is decided per kind (see each per-kind schema's `required`)."
+    }
+  }
+}

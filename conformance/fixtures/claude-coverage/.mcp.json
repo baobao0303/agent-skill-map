@@ -1,0 +1,1 @@
+{"mcpServers": {"github": {"command": "gh-mcp", "args": ["--stdio"], "env": {"TOKEN": "x"}}, "unused": {"type": "sse", "url": "https://u.test/mcp"}, "off": {"url": "https://o.test", "enabled": false}}}

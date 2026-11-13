@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skill-map.ai/spec/v1/sidecar.schema.json",
+  "title": "Sidecar",
+  "description": "Root shape of a co-located YAML sidecar (`<basename>.sm` next to `<basename>.md`). The `.sm` file IS the annotations file, every key under it is, conceptually, an annotation on the node. The YAML root organizes those annotations into structural blocks: `identity` (anchor + drift-detection hashes), `annotations` (the curated catalog of conventional fields), `audit` (timestamps), `settings` (reserved), and arbitrary `<plugin-id>:` namespaces for plugin-contributed data. Vendor file (`<basename>.md`) stays untouched. Schema is `additionalProperties: true` so plugins can add namespaces without coordination; the built-in `unknown-field` analyzer warns on truly unrecognized root keys (typo guard). Format is YAML, comments via `#`, multiline strings via `|` / `>`, permissive types per the YAML 1.2 spec. See `architecture.md` §Annotation system and ROADMAP §Step 9.6 for the design rationale.",
+  "type": "object",
+  "required": ["identity"],
+  "additionalProperties": true,
+  "properties": {
+    "identity": {
+      "$ref": "#/$defs/identity",
+      "description": "Anchor block linking this sidecar to its markdown node and capturing the body / frontmatter hashes at the moment of the last `bump`. Drift detection compares stored hashes against the current file at scan time; mismatch emits the built-in `annotation-stale` warning (soft mode, never blocking)."
+    },
+    "annotations": {
+      "$ref": "annotations.schema.json",
+      "description": "Skill-map annotation catalog. See `annotations.schema.json` for the curated 13-field surface; users / plugins MAY add custom keys (rides on `additionalProperties: true`)."
+    },
+    "settings": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Reserved for skill-map's per-node settings. v0.18.0 ships the block empty; consumers ride on `additionalProperties: true`. Concrete fields land in later sub-steps as the runtime grows."
+    },
+    "audit": {
+      "$ref": "#/$defs/audit",
+      "description": "Skill-map's audit trail. Populated by the built-in `bump` Action starting in Step 9.6.3 (Decision #125). All fields are optional at the property level, the Action atomically fills `lastBumpedAt` + `lastBumpedBy` on every bump and `createdAt` + `createdBy` on first creation. `additionalProperties: true` so future fields land additively."
+    }
+  },
+  "$defs": {
+    "audit": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "lastBumpedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601 datetime of the last `bump` Action invocation that materialised a write to this sidecar. Atomically set together with `lastBumpedBy` on every bump."
+        },
+        "lastBumpedBy": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Identity of the bump invoker. When the project is a Git repository with `user.name` configured, this is the resolved Git author name (`git config user.name`). Otherwise it falls back to the channel literal: `'cli'` for `sm bump`, `'ui'` for the BFF bump route, `'plugin:<plugin-id>'` when a plugin's deterministic Action triggered the bump. Tests / future invokers MAY pass any non-empty string."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601 datetime of the first `bump` invocation that ever wrote this sidecar. Set exactly once (when the `.sm` file did not previously exist on disk); stable across subsequent bumps."
+        },
+        "createdBy": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Identity of the invoker that created the sidecar (same value form as `lastBumpedBy`). Set exactly once at creation time and stable thereafter."
+        }
+      }
+    },
+    "identity": {
+      "type": "object",
+      "required": ["path", "bodyHash", "frontmatterHash"],
+      "additionalProperties": true,
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Relative path from the scope root to the `.md` file this sidecar annotates. Matches the canonical Node identifier (see `node.schema.json` #/properties/path). Survives content edits; breaks on file moves, `sm enrich` re-points the sidecar after a move."
+        },
+        "bodyHash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$",
+          "description": "sha256 of the body content (post-frontmatter), hex-encoded lowercase, captured at the moment this sidecar was last bumped. Compared against the current body hash to detect drift."
+        },
+        "frontmatterHash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$",
+          "description": "sha256 of the canonical frontmatter (per the kernel's `canonicalFrontmatter` analyzer), hex-encoded lowercase, captured at the moment this sidecar was last bumped. Compared against the current frontmatter hash to detect drift."
+        },
+        "resolvedAs": {
+          "type": "object",
+          "required": ["provider", "kind"],
+          "additionalProperties": false,
+          "properties": {
+            "provider": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Provider id that classifies this node (e.g. `claude`)."
+            },
+            "kind": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Kind within the Provider (e.g. `agent`, `skill`)."
+            }
+          },
+          "description": "Optional override of the Provider/kind classification. Set when path-based + content-based matching are ambiguous (a single `.md` matched by multiple Providers). When present, locks the classification to (`provider`, `kind`); when absent, the kernel uses its normal classification pipeline."
+        }
+      }
+    }
+  }
+}

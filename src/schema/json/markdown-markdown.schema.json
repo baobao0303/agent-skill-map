@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skill-map.ai/providers/core/v1/frontmatter/markdown.schema.json",
+  "title": "FrontmatterMarkdown",
+  "description": "Frontmatter shape for nodes classified as `markdown` by the built-in `core/markdown` Provider, the universal fallback for any markdown file no vendor-specific Provider claims (Claude, OpenAI Codex, agent-skills, plus the metadata-only Antigravity plugin). The kind is named after the format because the file is a generic fallback; format-named kinds apply only as the generic fallback, a TOML file that IS a Codex agent still classifies as `agent`, not `toml`. Extends the spec's universal `frontmatter/base.schema.json` via $ref-by-$id with no additional fields. Ownership relocated from the Claude Provider in spec 0.18.0, markdown is provider-agnostic and lives under `core` so adding new vendor Providers does not require choosing which one owns the universal fallback.",
+  "allOf": [
+    { "$ref": "https://skill-map.ai/spec/v1/frontmatter/base.schema.json" }
+  ],
+  "type": "object",
+  "additionalProperties": true
+}

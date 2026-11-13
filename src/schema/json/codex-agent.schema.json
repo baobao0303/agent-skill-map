@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skill-map.ai/providers/codex/v1/frontmatter/agent.schema.json",
+  "title": "FrontmatterCodexAgent",
+  "description": "Frontmatter shape for nodes classified as `agent` by the OpenAI Codex Provider. Codex sub-agents live as standalone TOML files under `.codex/agents/<name>.toml`; the entire file IS the agent definition (no markdown body, the prompt is the `developer_instructions` field). The TOML parser feeds the parsed root object into `frontmatter`, so this schema validates the same shape skill-map's other providers carry on per-kind frontmatter. Field set mirrors the documented Codex custom-agent contract (https://developers.codex.com/codex/subagents); `additionalProperties: true` lets any other inherited `config.toml` key flow through unchanged.",
+  "allOf": [
+    { "$ref": "https://skill-map.ai/spec/v1/frontmatter/base.schema.json" }
+  ],
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["name", "description", "developer_instructions"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Sub-agent identifier used when spawning the agent. Conventionally matches the filename stem."
+    },
+    "description": {
+      "type": "string",
+      "description": "Short description of when this sub-agent applies. Codex surfaces this in the agent picker; skill-map mirrors it in the card."
+    },
+    "developer_instructions": {
+      "type": "string",
+      "description": "The sub-agent's core behavioural prompt (TOML triple-quoted string), the Codex equivalent of a system prompt. Required: the Codex CLI refuses to load an agent role file that omits it, so skill-map flags the same gap as a schema violation. Fed through the body pipeline via the provider's `read.bodyField`, so the markdown links / mentions it carries become graph edges."
+    },
+    "model": {
+      "type": "string",
+      "description": "Model identifier (`gpt-5-codex`, `gpt-5.4`, ...) the sub-agent runs against. Inherits the parent's model when omitted."
+    },
+    "model_reasoning_effort": {
+      "type": "string",
+      "enum": ["minimal", "low", "medium", "high", "xhigh"],
+      "description": "Reasoning effort the sub-agent runs at (`xhigh` is model-dependent). Inherits the parent's setting when omitted."
+    },
+    "sandbox_mode": {
+      "type": "string",
+      "enum": ["read-only", "workspace-write", "danger-full-access"],
+      "description": "Codex sandbox mode the sub-agent runs under. Inherits the parent's policy when omitted."
+    },
+    "nickname_candidates": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Pool of display names Codex draws from when spawning instances of this sub-agent."
+    },
+    "mcp_servers": {
+      "type": "object",
+      "additionalProperties": { "type": "object" },
+      "description": "Agent-specific MCP server bindings: a TOML table keyed by server name (`[mcp_servers.<name>]`), each value a server config (`command` + `args`, or `url`). This is NOT the Claude `tools: [mcp__<server>__*]` array convention, which is claude-only."
+    },
+    "skills": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Skill overrides for this sub-agent. The `config` array (`[[skills.config]]` in TOML) lists skills by path with an enabled flag.",
+      "properties": {
+        "config": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "path": { "type": "string", "description": "Path to the skill's SKILL.md." },
+              "enabled": { "type": "boolean", "description": "Whether the skill is active for this sub-agent." }
+            }
+          }
+        }
+      }
+    }
+  }
+}

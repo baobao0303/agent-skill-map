@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skill-map.ai/providers/antigravity/v1/frontmatter/workflow.schema.json",
+  "title": "FrontmatterAntigravityWorkflow",
+  "description": "Frontmatter shape for nodes classified as `workflow` by the Google Antigravity Provider. Workflows are standalone Markdown files under `.agent/workflows/<name>.md` (note the SINGULAR `.agent`, distinct from the open-standard `.agents/skills/` plural that Antigravity adopted for skills). A workflow file is YAML frontmatter followed by a numbered list of markdown steps; the agent runs it when invoked as the slash command `/<name>`, where the handle is ALWAYS the filename stem. Per the documented Antigravity workflow contract (https://antigravity.google/docs/rules-workflows) `description` is the ONLY frontmatter field: workflows have NO `name` field (unlike skills, where `name` is an optional override), so this schema requires `description` and declares no other property. The step body may carry execution-control comments, the shipped runtime documents `// turbo` (per-step) and `// turbo-all` (file-wide); those are body markup, not frontmatter, so they are not modelled here. `additionalProperties: true` lets any future frontmatter key flow through unchanged.",
+  "allOf": [
+    { "$ref": "https://skill-map.ai/spec/v1/frontmatter/base.schema.json" }
+  ],
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["description"],
+  "properties": {
+    "description": {
+      "type": "string",
+      "maxLength": 1024,
+      "description": "What the workflow does and when to run it. Antigravity surfaces it in the slash-command picker and uses it for smart detection; skill-map mirrors it on the node card. Required by the Antigravity workflow contract (the only documented workflow frontmatter field). Max 1024 chars, non-empty (minLength from the spec base)."
+    }
+  }
+}

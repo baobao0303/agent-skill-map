@@ -93,11 +93,9 @@ pub struct Link {
     pub resolved_target: Option<String>,
 }
 
-#[derive(Serialize, Clone)]
-pub struct Fix {
-    pub summary: String,
-}
-
+/// An analyzer or kernel finding. `detail`, `fix` and `data` live in an
+/// ordered tail because the original emits them in a per-analyzer order
+/// (most give `fix` before `data`, `name-mismatch` the reverse).
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Issue {
@@ -105,10 +103,33 @@ pub struct Issue {
     pub severity: &'static str,
     pub node_ids: Vec<String>,
     pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fix: Option<Fix>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<Value>,
+    #[serde(flatten)]
+    pub tail: serde_json::Map<String, Value>,
+}
+
+impl Issue {
+    pub fn new(analyzer_id: &str, severity: &'static str, node_ids: Vec<String>, message: String) -> Self {
+        Issue { analyzer_id: analyzer_id.into(), severity, node_ids, message, tail: Default::default() }
+    }
+
+    pub fn detail(mut self, detail: impl Into<String>) -> Self {
+        self.tail.insert("detail".into(), Value::String(detail.into()));
+        self
+    }
+
+    pub fn fix(mut self, summary: &str) -> Self {
+        self.tail.insert("fix".into(), serde_json::json!({ "summary": summary }));
+        self
+    }
+
+    pub fn data(mut self, data: Value) -> Self {
+        self.tail.insert("data".into(), data);
+        self
+    }
+
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        self.tail.get(key)
+    }
 }
 
 #[derive(Serialize)]

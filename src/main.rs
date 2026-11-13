@@ -1,6 +1,7 @@
 mod analyze;
 mod canon_yaml;
 mod cli;
+mod diagnose;
 mod extract;
 mod format;
 mod frontmatter;
@@ -14,17 +15,16 @@ mod scan;
 mod scope;
 mod store;
 mod tokens;
+mod validate;
 mod walk;
 
 use clap::Parser;
-use std::io::IsTerminal;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let started = std::time::Instant::now();
     let cli = cli::Cli::parse();
-    let color = !cli.global.no_color && std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal();
-    let code = match cli::dispatch(&cli, &cli::Out { color }) {
+    let code = match cli::dispatch(&cli) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("✕  {}", e.message());

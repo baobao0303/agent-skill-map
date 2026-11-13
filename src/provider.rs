@@ -54,11 +54,6 @@ const MD: &[ReadRule] = &[ReadRule { extension: ".md", parser: Parser::Frontmatt
 
 const SKILL: Kind = Kind { name: "skill", identifiers: &[FrontmatterName, Dirname], identifier_mismatch_warn: true };
 
-const COMMONS_RESERVED: &[&str] = &[
-    "add-dir", "agents", "clear", "config", "exit", "feedback", "help", "hooks", "logout", "mcp", "model",
-    "permissions", "quit", "resume", "statusline", "usage",
-];
-
 const CLAUDE_RESERVED_SLASH: &[&str] = &[
     "help", "clear", "compact", "cost", "init", "model", "agents", "login", "logout", "mcp", "memory", "config",
     "doctor", "permissions", "add-dir", "bug", "pr-comments", "release-notes", "review", "terminal-setup", "vim",

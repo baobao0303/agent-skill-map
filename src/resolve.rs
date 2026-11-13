@@ -13,9 +13,19 @@ fn extractor_rank(id: &str) -> usize {
     extract::ORDER.iter().position(|e| *e == id).unwrap_or(usize::MAX)
 }
 
-/// Overlap clusters per source; losers are dropped. Returns links in signal order.
-pub fn resolve_signals(signals: &[Signal]) -> Vec<Link> {
+/// A signal that lost an overlap cluster (`extractor-collision` reads these).
+pub struct Rejection {
+    pub signal: usize,
+    pub winner_extractor: &'static str,
+    pub winner_range: (u64, u64),
+    pub reason: &'static str,
+}
+
+/// Overlap clusters per source; losers are dropped. Returns links in signal
+/// order plus the rejected signals.
+pub fn resolve_signals(signals: &[Signal]) -> (Vec<Link>, Vec<Rejection>) {
     let mut rejected = vec![false; signals.len()];
+    let mut rejections = Vec::new();
     let mut by_source: Vec<(&str, Vec<usize>)> = Vec::new();
     for (i, s) in signals.iter().enumerate() {
         if !(s.body_scope && s.range.is_some()) {
@@ -37,19 +47,37 @@ pub fn resolve_signals(signals: &[Signal]) -> Vec<Link> {
                     winner = challenger;
                 }
             }
+            let w = &signals[winner];
+            let wr = w.range.as_ref().unwrap();
             for &i in &cluster {
                 if i != winner {
                     rejected[i] = true;
+                    rejections.push(Rejection {
+                        signal: i,
+                        winner_extractor: w.candidates[0].extractor,
+                        winner_range: (wr.start, wr.end),
+                        reason: why_lost(w, &signals[i]),
+                    });
                 }
             }
         }
     }
-    signals
-        .iter()
-        .zip(rejected)
-        .filter(|(_, r)| !r)
-        .map(|(s, _)| materialise(s))
-        .collect()
+    let links = signals.iter().zip(rejected).filter(|(_, r)| !r).map(|(s, _)| materialise(s)).collect();
+    rejections.sort_by_key(|r| r.signal);
+    (links, rejections)
+}
+
+/// The tiebreak step that decided `winner` over `loser`.
+fn why_lost(winner: &Signal, loser: &Signal) -> &'static str {
+    let (a, b) = (&winner.candidates[0], &loser.candidates[0]);
+    let len = |s: &Signal| s.range.as_ref().map_or(0, |r| r.end - r.start);
+    if a.confidence != b.confidence {
+        "higher-confidence"
+    } else if len(winner) != len(loser) {
+        "longer-range"
+    } else {
+        "earlier-declaration"
+    }
 }
 
 fn overlap_clusters(signals: &[Signal], idx: &[usize]) -> Vec<Vec<usize>> {

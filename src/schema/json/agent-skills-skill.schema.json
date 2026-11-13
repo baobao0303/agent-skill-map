@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skill-map.ai/providers/agent-skills/v1/frontmatter/skill.schema.json",
+  "title": "FrontmatterAgentSkillsSkill",
+  "description": "Frontmatter shape for nodes classified as `skill` by the neutral `agent-skills` Provider, Agent Skills delivered as `SKILL.md` files at the open-standard path `.agents/skills/<name>/SKILL.md`. Jointly adopted by Anthropic, OpenAI (Codex), and Google (Gemini); the path is vendor-neutral so no single Provider should own it. Required fields are `name` and `description` (defined on the spec base, declared `required` here, the open standard mandates both). The standard's optional frontmatter fields are declared below, mirrored verbatim from https://agentskills.io/specification: `license`, `compatibility`, `metadata`, and the experimental `allowed-tools`. `additionalProperties: true` so any future standard field flows through unchanged until this schema catches up.",
+  "allOf": [
+    { "$ref": "https://skill-map.ai/spec/v1/frontmatter/base.schema.json" }
+  ],
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["name", "description"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+      "description": "Skill handle (also the parent directory name). Open-standard rules: 1-64 chars, lowercase alphanumeric and single hyphens only, no leading/trailing or consecutive hyphens. The `name == parent dirname` rule is cross-field and not expressible in a frontmatter schema. Source: https://agentskills.io/specification."
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 1024,
+      "description": "What the skill does and when to use it. Max 1024 chars, non-empty (minLength from the spec base). Source: https://agentskills.io/specification."
+    },
+    "license": {
+      "type": "string",
+      "description": "License applied to the skill: a license name (e.g. `Apache-2.0`) or a reference to a bundled license file. Source: https://agentskills.io/specification."
+    },
+    "compatibility": {
+      "type": "string",
+      "maxLength": 500,
+      "description": "Environment requirements (intended product, required system packages, network access, etc.). Most skills omit it. Max 500 characters. Source: https://agentskills.io/specification."
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Arbitrary string-keyed, string-valued map for client-defined metadata not covered by the standard. Source: https://agentskills.io/specification."
+    },
+    "allowed-tools": {
+      "type": "string",
+      "description": "Space-separated list of pre-approved tools the skill may run (e.g. `Bash(git:*) Read`). Experimental in the open standard; support varies between agent implementations. Source: https://agentskills.io/specification."
+    }
+  }
+}

@@ -1,0 +1,1 @@
+{"mcp": {"docs": {"type": "remote", "url": "https://d.test"}, "local1": {"type": "local", "command": ["x"]}}}

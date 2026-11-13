@@ -22,7 +22,7 @@ serde_json = { version = "1.0.154", features = ["preserve_order"] }
 sha2 = "0.11.1"
 tiktoken-rs = "0.12.1"
 time = "0.3.55"
-toml = "1.2.1"
+toml = { version = "1.2.1", features = ["preserve_order"] }
 unicode-general-category = "1.1.0"
 unicode-normalization = "0.1.26"
 url = "2.5.8"

@@ -13,7 +13,7 @@ use std::sync::LazyLock;
 static COLLATOR: LazyLock<CollatorBorrowed<'static>> =
     LazyLock::new(|| Collator::try_new(Default::default(), CollatorOptions::default()).expect("root collator"));
 
-fn locale_compare(a: &str, b: &str) -> Ordering {
+pub fn locale_compare(a: &str, b: &str) -> Ordering {
     COLLATOR.compare(a, b)
 }
 

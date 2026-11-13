@@ -92,11 +92,7 @@ impl CliError {
     }
 }
 
-pub struct Out {
-    pub color: bool,
-}
-
-pub fn dispatch(cli: &Cli, out: &Out) -> Result<u8, CliError> {
+pub fn dispatch(cli: &Cli) -> Result<u8, CliError> {
     let root = std::env::current_dir().map_err(|e| CliError::Operational(e.to_string()))?;
     let scope = Scope::new(root);
     let Some(command) = &cli.command else {
@@ -105,7 +101,7 @@ pub fn dispatch(cli: &Cli, out: &Out) -> Result<u8, CliError> {
     match command {
         Command::Version => version(cli, &scope),
         Command::Scan { no_tokens, max_scan, max_nodes, dry_run } => {
-            run_scan(cli, out, &scope, !no_tokens, *max_scan, *max_nodes, *dry_run)
+            run_scan(cli, &scope, !no_tokens, *max_scan, *max_nodes, *dry_run)
         }
         Command::Check { node } => check(cli, &scope, node.as_deref()),
         Command::List { kind } => list(cli, &scope, kind.as_deref()),
@@ -182,7 +178,6 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 
 fn run_scan(
     cli: &Cli,
-    out: &Out,
     scope: &Scope,
     tokenize: bool,
     max_scan: Option<u64>,
@@ -221,11 +216,25 @@ fn run_scan(
     if cli.global.json {
         println!("{}", jsjson::to_string(&result));
     } else {
-        let warnings = result.issues.iter().filter(|i| i.severity == "warn").count();
-        let infos = result.issues.iter().filter(|i| i.severity == "info").count();
+        // Distinct affected nodes per severity, not issue counts.
+        let affected = |sev: &str| {
+            let mut ids: Vec<&str> = Vec::new();
+            for i in result.issues.iter().filter(|i| i.severity == sev) {
+                if i.node_ids.is_empty() && !ids.contains(&"") {
+                    ids.push("");
+                }
+                for id in &i.node_ids {
+                    if !ids.contains(&id.as_str()) {
+                        ids.push(id);
+                    }
+                }
+            }
+            ids.len()
+        };
+        let (errs, warnings, infos) = (affected("error"), affected("warn"), affected("info"));
         let mut counts = vec![plural(result.nodes.len(), "node", "nodes"), plural(result.links.len(), "link", "links")];
-        if errors > 0 {
-            counts.push(plural(errors, "error", "errors"));
+        if errs > 0 {
+            counts.push(plural(errs, "error", "errors"));
         }
         if warnings > 0 {
             counts.push(plural(warnings, "warning", "warnings"));
@@ -233,10 +242,10 @@ fn run_scan(
         if infos > 0 {
             counts.push(format!("{infos} info"));
         }
-        if errors + warnings + infos == 0 {
+        if errs + warnings + infos == 0 {
             counts.push("0 issues".into());
         }
-        let glyph = if !out.color { " " } else if errors > 0 { "✕" } else { "✓" };
+        let glyph = if errors > 0 { " " } else { "✓" };
         println!("  {glyph}  {}   in {}", counts.join(" · "), format_elapsed(result.stats.duration_ms));
         let shown = db.strip_prefix(&scope.root).unwrap_or(&db).display().to_string();
         if dry_run {
