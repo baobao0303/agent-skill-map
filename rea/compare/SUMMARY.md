@@ -43,6 +43,7 @@ Not ported: the partial cache hit (some but not all of a node's extractors still
 |---|---|---|
 | `bump.sh` (example): flag mutexes, disabled extension, unknown node, consent refusal, `--yes`, fresh refusal, `--force`, `--json`, `--pending`, `--pending --json`, `--staged` outside git | 18 | identical transcript incl. `.sm` bytes (timestamps masked) and 0600 modes |
 | `sidecars.sh` (example): `refresh` / `annotate` / `prune` incl. consent, `--force`, `--json`, dry-run, non-TTY confirm | 16 | identical |
+| `orphans.sh` (claude-coverage): list, `--kind`, `--json`, `reconcile` (incl. dry-run and a PK collision), `undo-rename` (mismatch, non-TTY prompt, dry-run, `--force`), DB state after each | 15 | identical |
 | `issues.sh` (claude-coverage): `dismiss` / `undismiss` / `suppressions`, unknown analyzer, missing node, consent, notes, duplicates, `check` after dismissal, rescan, operations.log entries | 18 | identical |
 
 The consent grant (`scope.lock.json`, sha256 over the `.skill-map/` inode and birth time) is interoperable: a grant minted by `sm` is accepted by `asm` in the same checkout.

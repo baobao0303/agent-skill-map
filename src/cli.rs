@@ -104,6 +104,14 @@ pub enum Command {
         #[command(subcommand)]
         command: IssuesCommand,
     },
+    /// List orphan / auto-rename issues, or act on them.
+    Orphans {
+        /// orphan | medium | ambiguous
+        #[arg(long)]
+        kind: Option<String>,
+        #[command(subcommand)]
+        command: Option<OrphansCommand>,
+    },
     /// Print the current issues from the database.
     Check {
         /// Restrict to issues of this node.
@@ -177,6 +185,28 @@ pub enum IssuesCommand {
     },
 }
 
+#[derive(Subcommand)]
+pub enum OrphansCommand {
+    /// Migrate state_* FKs from an orphan path to a live node.
+    Reconcile {
+        orphan: String,
+        #[arg(long)]
+        to: String,
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+    },
+    /// Reverse a medium- or ambiguous-confidence auto-rename.
+    UndoRename {
+        new_path: String,
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        force: bool,
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+    },
+}
+
 pub enum CliError {
     Usage(String),
     NotFound(String),
@@ -244,6 +274,21 @@ pub fn dispatch(cli: &Cli) -> Result<u8, CliError> {
                     issues::undismiss(cli, &scope, &db, Target { analyzer, value, node, yes: *yes })
                 }
                 IssuesCommand::Suppressions { node } => issues::suppressions(cli, &db, node.as_deref()),
+            }
+        }
+        Command::Orphans { kind, command } => {
+            let db = db_path(cli, &scope);
+            match command {
+                None => crate::orphans::list(cli, &db, kind.as_deref()),
+                Some(OrphansCommand::Reconcile { orphan, to, dry_run }) => {
+                    crate::orphans::reconcile(cli, &scope, &db, orphan, to, *dry_run)
+                }
+                Some(OrphansCommand::UndoRename { new_path, from, force, dry_run }) => crate::orphans::undo_rename(
+                    cli,
+                    &scope,
+                    &db,
+                    crate::orphans::UndoArgs { new_path, from: from.as_deref(), force: *force, dry_run: *dry_run },
+                ),
             }
         }
         Command::Sidecars { command } => {

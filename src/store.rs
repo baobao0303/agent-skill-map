@@ -55,44 +55,104 @@ fn opt_json<T: serde::Serialize>(v: &Option<T>) -> Option<String> {
     v.as_ref().map(|x| json(x))
 }
 
-/// Re-point every `state_*` reference of a renamed node (`migrateNodeFks`).
-/// On a primary-key collision at the new path the existing row wins and the
-/// migrating one is dropped.
-fn migrate_node_fks(tx: &rusqlite::Transaction, from: &str, to: &str) -> rusqlite::Result<()> {
-    if from == to {
-        return Ok(());
+/// Rows moved by [`migrate_node_fks`]; `collisions` counts rows dropped
+/// because the destination already held the same composite key.
+#[derive(Default)]
+pub struct MigrateReport {
+    pub jobs: usize,
+    pub executions: usize,
+    pub summaries: usize,
+    pub findings: usize,
+    pub enrichments: usize,
+    pub plugin_kvs: usize,
+    pub node_favorites: usize,
+    pub collisions: usize,
+}
+
+impl MigrateReport {
+    /// `summaryTotal` (activity tables are not part of the total).
+    pub fn total(&self) -> usize {
+        self.jobs + self.executions + self.summaries + self.findings + self.enrichments + self.plugin_kvs + self.node_favorites
     }
-    tx.execute("UPDATE state_jobs SET node_id = ?2 WHERE node_id = ?1", params![from, to])?;
+}
+
+/// Re-point every `state_*` reference of a node to a new path
+/// (`migrateNodeFks`). On a primary-key collision at the new path the
+/// existing row wins and the migrating one is dropped.
+pub fn migrate_node_fks(tx: &Connection, from: &str, to: &str) -> rusqlite::Result<MigrateReport> {
+    let mut r = MigrateReport::default();
+    if from == to {
+        return Ok(r);
+    }
+    r.jobs = tx.execute("UPDATE state_jobs SET node_id = ?2 WHERE node_id = ?1", params![from, to])?;
     let rows: Vec<(i64, String)> = {
         let mut st = tx.prepare(
             "SELECT id, node_ids_json FROM state_executions
              WHERE EXISTS (SELECT 1 FROM json_each(state_executions.node_ids_json) je WHERE je.value = ?1)",
         )?;
-        st.query_map([from], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?
+        st.query_map([from], |row| Ok((row.get(0)?, row.get(1)?)))?.collect::<Result<_, _>>()?
     };
     for (id, ids) in rows {
         let ids: Vec<String> = serde_json::from_str(&ids).unwrap_or_default();
         let ids: Vec<&str> = ids.iter().map(|p| if p == from { to } else { p.as_str() }).collect();
         tx.execute("UPDATE state_executions SET node_ids_json = ?2 WHERE id = ?1", params![id, serde_json::to_string(&ids).unwrap()])?;
+        r.executions += 1;
     }
-    tx.execute("UPDATE state_findings SET node_id = ?2 WHERE node_id = ?1", params![from, to])?;
-    for (table, col) in [("state_summaries", "node_id"), ("state_enrichments", "node_id")] {
-        tx.execute(&format!("UPDATE OR IGNORE {table} SET {col} = ?2 WHERE {col} = ?1"), params![from, to])?;
-        tx.execute(&format!("DELETE FROM {table} WHERE {col} = ?1"), [from])?;
-    }
-    if !from.is_empty() {
-        tx.execute("UPDATE OR IGNORE state_plugin_kvs SET node_id = ?2 WHERE node_id = ?1", params![from, to])?;
-        tx.execute("DELETE FROM state_plugin_kvs WHERE node_id = ?1", [from])?;
-    }
-    for table in ["state_node_favorites", "state_activity_stats"] {
-        tx.execute(&format!("UPDATE OR IGNORE {table} SET node_path = ?2 WHERE node_path = ?1"), params![from, to])?;
-        tx.execute(&format!("DELETE FROM {table} WHERE node_path = ?1"), [from])?;
-    }
-    tx.execute("UPDATE OR IGNORE state_activity_pairs SET parent = ?2 WHERE parent = ?1", params![from, to])?;
-    tx.execute("DELETE FROM state_activity_pairs WHERE parent = ?1", [from])?;
-    tx.execute("UPDATE OR IGNORE state_activity_pairs SET child_node_path = ?2 WHERE child_node_path = ?1", params![from, to])?;
-    tx.execute("DELETE FROM state_activity_pairs WHERE child_node_path = ?1", [from])?;
-    tx.execute("UPDATE node_enrichments SET node_path = ?2 WHERE node_path = ?1", params![from, to])?;
+    // Move what fits, then drop the rows that collided with the destination.
+    let mut keyed = |table: &str, col: &str, extra: &str| -> rusqlite::Result<usize> {
+        let moved = tx.execute(&format!("UPDATE OR IGNORE {table} SET {col} = ?2 WHERE {col} = ?1 {extra}"), params![from, to])?;
+        r.collisions += tx.execute(&format!("DELETE FROM {table} WHERE {col} = ?1 {extra}"), [from])?;
+        Ok(moved)
+    };
+    let summaries = keyed("state_summaries", "node_id", "")?;
+    let enrichments = keyed("state_enrichments", "node_id", "")?;
+    let kvs = if from.is_empty() { 0 } else { keyed("state_plugin_kvs", "node_id", "")? };
+    let favorites = keyed("state_node_favorites", "node_path", "")?;
+    keyed("state_activity_stats", "node_path", "")?;
+    keyed("state_activity_pairs", "parent", "")?;
+    keyed("state_activity_pairs", "child_node_path", "")?;
+    r.summaries = summaries;
+    r.enrichments = enrichments;
+    r.plugin_kvs = kvs;
+    r.node_favorites = favorites;
+    r.findings = tx.execute("UPDATE state_findings SET node_id = ?2 WHERE node_id = ?1", params![from, to])?;
+    Ok(r)
+}
+
+/// Persisted issues with their row ids, in row order.
+pub fn issues_with_ids(conn: &Connection) -> rusqlite::Result<Vec<(i64, Issue)>> {
+    let mut st = conn.prepare("SELECT id, analyzer_id, severity, node_ids_json, message, fix_json, data_json, detail FROM scan_issues ORDER BY id")?;
+    st.query_map([], |r| {
+        let mut issue = Issue::new(&r.get::<_, String>(1)?, leak(r.get(2)?), parse(r.get(3)?).unwrap_or_default(), r.get(4)?);
+        if let Some(d) = r.get::<_, Option<String>>(7)? {
+            issue = issue.detail(d);
+        }
+        if let Some(f) = parse::<Value>(r.get(5)?) {
+            issue.tail.insert("fix".into(), f);
+        }
+        if let Some(d) = parse::<Value>(r.get(6)?) {
+            issue = issue.data(d);
+        }
+        Ok((r.get(0)?, issue))
+    })?
+    .collect()
+}
+
+/// Insert one issue row (orphans undo-rename).
+pub fn insert_issue(conn: &Connection, issue: &Issue) -> rusqlite::Result<()> {
+    let v = serde_json::to_value(issue).unwrap_or_default();
+    conn.execute(
+        "INSERT INTO scan_issues (analyzer_id, severity, node_ids_json, message, detail, fix_json, data_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            issue.analyzer_id,
+            issue.severity,
+            crate::jsjson::to_string(&issue.node_ids),
+            issue.message,
+            v.get("detail").and_then(Value::as_str),
+            v.get("fix").map(crate::jsjson::to_string),
+            v.get("data").map(crate::jsjson::to_string),
+        ],
+    )?;
     Ok(())
 }
 
@@ -210,6 +270,7 @@ pub fn persist(
     let tx = conn.transaction()?;
     for r in renames {
         migrate_node_fks(&tx, &r.from, &r.to)?;
+        tx.execute("UPDATE node_enrichments SET node_path = ?2 WHERE node_path = ?1", params![r.from, r.to])?;
     }
     append_stranded_orphans(&tx, scan)?;
     tx.execute("DELETE FROM scan_extractor_runs", [])?;
