@@ -112,6 +112,16 @@ pub enum Command {
         #[command(subcommand)]
         command: Option<OrphansCommand>,
     },
+    /// Install / inspect the sm-process-jobs agent skill.
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
+    /// The probabilistic job queue.
+    Jobs {
+        #[command(subcommand)]
+        command: JobsCommand,
+    },
     /// Print the current issues from the database.
     Check {
         /// Restrict to issues of this node.
@@ -207,6 +217,85 @@ pub enum OrphansCommand {
     },
 }
 
+#[derive(Subcommand)]
+pub enum AgentCommand {
+    /// Materialise the sm-process-jobs process skill into the lens's skill directory.
+    Install {
+        #[arg(long = "for")]
+        for_provider: Option<String>,
+    },
+    /// Remove the materialised sm-process-jobs process skill.
+    Uninstall {
+        #[arg(long = "for")]
+        for_provider: Option<String>,
+    },
+    /// Report the sm-process-jobs process skill install state.
+    Status {
+        #[arg(long = "for")]
+        for_provider: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum JobsCommand {
+    /// Enqueue a probabilistic extension against a node (-n), every matching node (--all), or none (nodeless).
+    Submit {
+        extension: String,
+        #[arg(short = 'n')]
+        node: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        force: bool,
+        #[arg(long, allow_hyphen_values = true)]
+        ttl: Option<String>,
+        #[arg(long, allow_hyphen_values = true)]
+        priority: Option<String>,
+    },
+    /// List jobs.
+    List {
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        extension: Option<String>,
+        #[arg(long)]
+        node: Option<String>,
+    },
+    /// Job detail.
+    Show { id: String },
+    /// Print a job's rendered content.
+    Preview {
+        id: Option<String>,
+        #[arg(long)]
+        last: bool,
+    },
+    /// Atomically claim the next queued job.
+    Claim {
+        #[arg(long)]
+        filter: Option<String>,
+        #[arg(long)]
+        wait: bool,
+        #[arg(long)]
+        interval: Option<String>,
+        #[arg(long)]
+        timeout: Option<String>,
+    },
+    /// Counts per status, or one job's status.
+    Status { id: Option<String> },
+    /// Cancel a queued / running job (or --all).
+    Cancel {
+        id: Option<String>,
+        #[arg(long)]
+        all: bool,
+    },
+    /// Fail a queued / running job with reason user-failed (or --all).
+    Fail {
+        id: Option<String>,
+        #[arg(long)]
+        all: bool,
+    },
+}
+
 pub enum CliError {
     Usage(String),
     NotFound(String),
@@ -291,6 +380,43 @@ pub fn dispatch(cli: &Cli) -> Result<u8, CliError> {
                 ),
             }
         }
+        Command::Jobs { command } => {
+            use crate::jobs;
+            let db = db_path(cli, &scope);
+            match command {
+                JobsCommand::Submit { extension, node, all, force, ttl, priority } => jobs::submit(
+                    cli,
+                    &scope,
+                    &db,
+                    jobs::SubmitArgs {
+                        extension,
+                        node: node.as_deref(),
+                        all: *all,
+                        force: *force,
+                        ttl: ttl.as_deref(),
+                        priority: priority.as_deref(),
+                    },
+                ),
+                JobsCommand::List { status, extension, node } => {
+                    jobs::list(cli, &db, status.as_deref(), extension.as_deref(), node.as_deref())
+                }
+                JobsCommand::Show { id } => jobs::show(cli, &db, id),
+                JobsCommand::Preview { id, last } => jobs::preview(&db, id.as_deref(), *last),
+                JobsCommand::Claim { filter, wait, interval, timeout } => jobs::claim(
+                    cli,
+                    &db,
+                    jobs::ClaimArgs { filter: filter.as_deref(), wait: *wait, interval: interval.as_deref(), timeout: timeout.as_deref() },
+                ),
+                JobsCommand::Status { id } => jobs::status(cli, &db, id.as_deref()),
+                JobsCommand::Cancel { id, all } => jobs::terminate(cli, &scope, &db, id.as_deref(), *all, false),
+                JobsCommand::Fail { id, all } => jobs::terminate(cli, &scope, &db, id.as_deref(), *all, true),
+            }
+        }
+        Command::Agent { command } => match command {
+            AgentCommand::Install { for_provider } => crate::agent::install(cli, &scope, for_provider.as_deref()),
+            AgentCommand::Uninstall { for_provider } => crate::agent::uninstall(cli, &scope, for_provider.as_deref()),
+            AgentCommand::Status { for_provider } => crate::agent::status_cmd(cli, &scope, for_provider.as_deref()),
+        },
         Command::Sidecars { command } => {
             let db = db_path(cli, &scope);
             match command {
@@ -341,6 +467,20 @@ fn setting_u64(settings: &serde_json::Map<String, Value>, key: &str, default: u6
 
 /// Resolve the active lens: settings → marker auto-detect (persisted when
 /// unambiguous) → the open `agent-skills` default.
+/// The active lens without side effects (settings, else one marker, else the
+/// open `agent-skills` default; several markers fall back to the default).
+pub fn detect_lens(scope: &Scope) -> String {
+    if let Some(id) = scope.settings().get("activeProvider").and_then(Value::as_str)
+        && provider::get(id).is_some()
+    {
+        return id.to_string();
+    }
+    match provider::detect_candidates(&scope.root).as_slice() {
+        [one] => one.to_string(),
+        _ => "agent-skills".into(),
+    }
+}
+
 fn resolve_lens(scope: &Scope, dry_run: bool, json_mode: bool) -> Result<String, CliError> {
     let mut settings = scope.settings();
     if let Some(id) = settings.get("activeProvider").and_then(Value::as_str)

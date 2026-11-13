@@ -1,12 +1,15 @@
+mod agent;
 mod analyze;
 mod bump;
 mod canon_yaml;
+mod catalog;
 mod cli;
 mod diagnose;
 mod extract;
 mod format;
 mod frontmatter;
 mod issues;
+mod jobs;
 mod jsjson;
 mod mask;
 mod model;

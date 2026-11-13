@@ -538,6 +538,29 @@ fn build_entry(e: &walk::Entry, p: &provider::Provider, rule: &provider::ReadRul
     Some(build_node(&e.rel, kind, pid, rule, &text, e.mtime_ms, c.tokenize, cached))
 }
 
+/// The body the scan hashed for `rel` under `provider` (submit-time drift
+/// check): `Err` names why the file could not be read.
+pub fn read_body(root: &Path, rel: &str, provider_id: &str) -> Result<String, String> {
+    let text = std::fs::read_to_string(root.join(rel)).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => format!("node {rel} is not on disk (deleted since the last scan?)"),
+        _ => format!("cannot read {rel}: {e}"),
+    })?;
+    let p = provider::get(provider_id).unwrap_or(&PROVIDERS[PROVIDERS.len() - 1]);
+    let rule = p.read.iter().find(|r| rel.ends_with(r.extension)).or(p.read.first());
+    Ok(match rule.map(|r| (r.parser, r.body_field)) {
+        Some((Parser::Toml, field)) => toml::from_str::<toml::Table>(&text)
+            .ok()
+            .and_then(|t| serde_json::to_value(t).ok())
+            .and_then(|v| field.and_then(|f| v.get(f)).and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_default(),
+        _ => frontmatter::parse(&text).body.to_string(),
+    })
+}
+
+pub fn sha256_pub(s: &str) -> String {
+    sha256_hex(s)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_node(
     rel: &str,

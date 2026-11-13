@@ -50,4 +50,4 @@ The consent grant (`scope.lock.json`, sha256 over the `.skill-map/` inode and bi
 
 # Spec conformance suite (original runner)
 
-`node conformance/run-spec.mjs <sm|asm> [case...]` drives the 51 spec-owned cases of `@skill-map/spec` with the ORIGINAL runner (`@skill-map/cli/dist/conformance`); `conformance/asm-shim.cjs` lets it spawn the Rust binary. Baseline: `sm` 51/51, `asm` 12/51. The remaining failures are verbs not yet ported (`agent`, `jobs`, `record`, `findings`, `history`, `plugins`, `config`, `serve`, `conformance`, `enrich`) and the drop-in JS plugin runtime.
+`node conformance/run-spec.mjs <sm|asm> [case...]` drives the 51 spec-owned cases of `@skill-map/spec` with the ORIGINAL runner (`@skill-map/cli/dist/conformance`); `conformance/asm-shim.cjs` lets it spawn the Rust binary. Baseline: `sm` 51/51, `asm` 24/51 (after agent + jobs). The remaining failures are verbs not yet ported (`agent`, `jobs`, `record`, `findings`, `history`, `plugins`, `config`, `serve`, `conformance`, `enrich`) and the drop-in JS plugin runtime.
