@@ -1,0 +1,3 @@
+[mcp_servers.search]
+command = "search-mcp"
+args = ["serve"]

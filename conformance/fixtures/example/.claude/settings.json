@@ -1,0 +1,59 @@
+{
+  "hooks": {
+    "UserPromptExpansion": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .skill-map/activity/bridge.js claude"
+          }
+        ],
+        "matcher": "*"
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .skill-map/activity/bridge.js claude"
+          }
+        ],
+        "matcher": "^(Skill|Agent|Read|Write|Edit|mcp__.+)$"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .skill-map/activity/bridge.js claude"
+          }
+        ],
+        "matcher": "^Agent$"
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .skill-map/activity/bridge.js claude"
+          }
+        ],
+        "matcher": "*"
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .skill-map/activity/bridge.js claude"
+          }
+        ],
+        "matcher": "*"
+      }
+    ]
+  }
+}

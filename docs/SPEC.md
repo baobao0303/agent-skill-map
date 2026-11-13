@@ -1,4 +1,4 @@
-# skflow Technical Specification
+# agent-skill-map Technical Specification
 
 ## Core Pipeline Architecture
 1. **Source Ingestion**:

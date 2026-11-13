@@ -1,0 +1,9 @@
+identity:
+  path: .claude/skills/experimental/SKILL.md
+  bodyHash: x
+  frontmatterHash: y
+annotations:
+  stability: experimental
+  issueSuppressions:
+    - analyzer: core/reference-broken
+      value: SKILL.md

@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skill-map.ai/providers/opencode/v1/frontmatter/agent.schema.json",
+  "title": "FrontmatterOpenCodeAgent",
+  "description": "Frontmatter shape for nodes classified as `agent` by the OpenCode Provider. OpenCode agents live as markdown files under `.opencode/agent/<name>.md` (https://opencode.ai/docs/agents); the markdown body is the agent prompt. There is NO `name` field, the filename stem is the handle. Field set mirrors OpenCode's documented agent frontmatter; `additionalProperties: true` lets any other inherited key flow through unchanged.",
+  "allOf": [
+    { "$ref": "https://skill-map.ai/spec/v1/frontmatter/base.schema.json" }
+  ],
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["description"],
+  "properties": {
+    "description": {
+      "type": "string",
+      "description": "What the agent does and when to use it. OpenCode surfaces this when selecting a subagent; skill-map mirrors it in the card. Required: a description-less agent cannot be meaningfully selected."
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["all", "primary", "subagent"],
+      "description": "How the agent runs: `primary` (a top-level agent the user can switch to), `subagent` (invoked by another agent via the `task` tool), or `all`. Inherits OpenCode's default when omitted."
+    },
+    "model": {
+      "type": "string",
+      "description": "Model the agent runs against, in OpenCode's `provider/model` form (e.g. `anthropic/claude-opus-4-8`). Inherits the parent's model when omitted."
+    },
+    "permission": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Per-tool permission policy. Each documented tool key maps to `allow`, `ask`, or `deny`; `bash` may instead be a map of command globs to policies. Any tool omitted inherits OpenCode's default.",
+      "properties": {
+        "edit": { "type": "string", "enum": ["allow", "ask", "deny"] },
+        "bash": {
+          "description": "Either a blanket policy or a per-command-glob map.",
+          "oneOf": [
+            { "type": "string", "enum": ["allow", "ask", "deny"] },
+            {
+              "type": "object",
+              "additionalProperties": { "type": "string", "enum": ["allow", "ask", "deny"] }
+            }
+          ]
+        },
+        "webfetch": { "type": "string", "enum": ["allow", "ask", "deny"] }
+      }
+    }
+  }
+}

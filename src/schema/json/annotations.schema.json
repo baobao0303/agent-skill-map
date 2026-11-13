@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skill-map.ai/spec/v1/annotations.schema.json",
+  "title": "Annotations",
+  "description": "Catalog of conventional annotation fields skill-map ships out of the box, written into the `annotations:` block of a sidecar (`<basename>.sm`). Every field is OPTIONAL, a sidecar with an empty `annotations: {}` is valid. Schema is `additionalProperties: true` so users / plugins can add custom keys without coordination; the built-in `unknown-field` analyzer emits a warning on unrecognized keys (typo guard). The curated catalog is the load-bearing fields below, versioning (`version`, `stability`), provenance (`authors`, `license`, `source`, `sourceVersion`), taxonomy (`tags`), docs (`docsUrl`). The activity timestamp lives in the reserved `audit:` block (`audit.lastBumpedAt`), not in `annotations:`. Plugins that want first-class custom keys with their own validation declare `annotationContributions` in their manifest (see Step 9.6.6).",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonic counter. Bumped via the built-in `bump` Action when the underlying node changes meaningfully. Orthogonal to `stability`, `stability` carries the lifecycle stage; `version` is just a counter. There is no major: a change so big it would justify a major bump uses the convention `create a new node and retire the old one` instead. Default: missing == unversioned."
+    },
+    "stability": {
+      "type": "string",
+      "enum": [
+        "experimental",
+        "stable",
+        "deprecated"
+      ],
+      "description": "Lifecycle stage. Denormalized into `scan_nodes.stability` for fast queries (see `node.schema.json` #/properties/stability). Default: missing == unspecified."
+    },
+    "authors": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Multi-author list. Single-author files use a one-element array."
+    },
+    "license": {
+      "type": "string",
+      "minLength": 1,
+      "description": "SPDX identifier preferred (e.g. `MIT`, `Apache-2.0`); free-form accepted."
+    },
+    "source": {
+      "type": "string",
+      "format": "uri",
+      "description": "URL of the canonical upstream (e.g. GitHub raw URL). Consumed by the `github-enrichment` Action for hash verification."
+    },
+    "sourceVersion": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Tag, branch, or full commit SHA at the upstream. Drives `github-enrichment` SHA pin / tag resolution."
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Taxonomy tags for this node. Tags are a **skill-map concept**, not a vendor field: no agent format carries `tags` in frontmatter, so they live here in the `.sm` sidecar. Written by whoever curates the project. `sm list --tag <name>` and the UI's faceted search match this field; the UI renders them as chips on the node card and inspector. Empty array and missing field are equivalent."
+    },
+    "docsUrl": {
+      "type": "string",
+      "format": "uri",
+      "description": "Canonical docs URL for this node (separate from `source`, which points at the file's upstream)."
+    },
+    "suppressions": {
+      "type": "array",
+      "description": "Standing user declarations that silence probabilistic findings on THIS node: each entry suppresses findings whose emitting extension matches `extension` (qualified id) and, when `type` is present, whose finding type matches it (absent = every type from that extension). Written by `sm findings dismiss <id>` through the gated sidecar channel (the durable half of dismissing: the dismissed rows are deleted and the finder's record path drops matching findings before they land, so they never return until the entry is removed, by editing this file). Kernel safety-lane findings (origin `kernel`, the reserved `injection-detected` / `content-suspicious` / `content-malformed` slugs) are NOT suppressible. Suppressions are per (extension, type), not per finding occurrence: findings carry no stable identity across finder runs, so the honest durable grain is the judgment CLASS.",
+      "items": {
+        "type": "object",
+        "required": [
+          "extension"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "extension": {
+            "type": "string",
+            "description": "Qualified extension id of the finder whose findings are suppressed (e.g. `core/ai-contradiction-analyzer`)."
+          },
+          "type": {
+            "type": "string",
+            "description": "Optional finding type slug; absent suppresses every type from the extension."
+          },
+          "note": {
+            "type": "string",
+            "description": "Optional one-line reason, the operator's own record of why this judgment class is fine here."
+          }
+        }
+      }
+    },
+    "issueSuppressions": {
+      "type": "array",
+      "description": "Standing user declarations that silence DETERMINISTIC analyzer issues on THIS node, keyed by (analyzer, value): the emitting analyzer and the verbatim token the issue flagged. Unlike probabilistic findings, issues DO have a stable cross-scan identity, the analyzer id plus the flagged value (`Issue.data.target`, e.g. `@ApiSecurity`), so the honest durable grain here is the occurrence value, not the judgment class. Matching is exact and case-sensitive on `value` (a later `@apisecurity` is a different token and is NOT suppressed). Applied at EMISSION time: the analyzer consults these entries and skips both the issue and its confidence penalty on every scan, a deliberate divergence from the findings read-time lens (issues carry no row id and are regenerated wholesale each scan, so there is nothing to lens over). Written by `sm issues dismiss` through the gated sidecar channel; dismissing also deletes the matching persisted rows so reads agree immediately, while undismissing needs a rescan for the issue to reappear.",
+      "items": {
+        "type": "object",
+        "required": [
+          "analyzer",
+          "value"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "analyzer": {
+            "type": "string",
+            "description": "Analyzer id whose issues are suppressed. Qualified id preferred (e.g. `core/reference-broken`); the bare short id also matches (same qualified-or-short rule as `sm check --analyzers`)."
+          },
+          "value": {
+            "type": "string",
+            "description": "Verbatim flagged token, matched exactly and case-sensitively against the issue's `data.target` (e.g. `@ApiSecurity`, `@nestjs/swagger`)."
+          },
+          "note": {
+            "type": "string",
+            "description": "Optional one-line reason, the operator's own record of why this value is fine here."
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,4 +1,4 @@
-# skflow (SkillFlow)
+# agent-skill-map
 
 > High-performance Rust CLI & Visual Pipeline Engine for AI Agent Skills, Prompt Topology & Dynamic Execution.
 > Inspired by `skill-map` (https://skill-map.ai) and powered by `@foblex/flow` visual canvas primitives.
@@ -13,7 +13,7 @@ Multi-agent and skill ecosystems (Claude Code, Hermes Agent, Codex, SLPC) run in
 3. **Broken Dependency Chains**: Agent handoffs or slash commands referencing missing skills or prompts.
 4. **Black Box Execution**: Lack of live topological visibility into what agents actually loaded and ran.
 
-`skflow` is a native Rust reimplementation delivering **10-50x faster scanning**, **zero runtime overhead (<20MB RAM)**, and **instant CI/Pre-commit gating**, coupled with an interactive DAG canvas.
+`agent-skill-map` (`asm`) is a native Rust reimplementation delivering **10-50x faster scanning**, **zero runtime overhead (<20MB RAM)**, and **instant CI/Pre-commit gating**, coupled with an interactive DAG canvas.
 
 ---
 
@@ -31,7 +31,7 @@ Multi-agent and skill ecosystems (Claude Code, Hermes Agent, Codex, SLPC) run in
 ## 3. Architecture Blueprint
 
 ```
-skflow (Single Binary CLI)
+agent-skill-map (Single Binary CLI: asm / agent-skill-map)
 ├── crates/cli        -> Command line interface (clap v4)
 ├── crates/core       -> AST parser (pulldown-cmark, gray_matter)
 ├── crates/linter     -> Token counting (tiktoken-rs), collision detector
@@ -40,10 +40,10 @@ skflow (Single Binary CLI)
 ```
 
 ### CLI Verbs
-- `skflow scan [path]`: Fast parallel scan of skills and agent definitions.
-- `skflow lint [path]`: Audit token weight, trigger collisions, and dead links.
-- `skflow graph --format [mermaid|json|dot]`: Output topology.
-- `skflow serve --port 3000`: Launch live interactive visualizer.
+- `asm scan [path]`: Fast parallel scan of skills and agent definitions.
+- `asm lint [path]`: Audit token weight, trigger collisions, and dead links.
+- `asm graph --format [mermaid|json|dot]`: Output topology.
+- `asm serve --port 3000`: Launch live interactive visualizer.
 
 ---
 
@@ -54,5 +54,5 @@ skflow (Single Binary CLI)
 cargo build --release
 
 # Run scanner against local Hermes skills
-./target/release/skflow scan ~/.hermes/skills
+./target/release/asm scan ~/.hermes/skills
 ```

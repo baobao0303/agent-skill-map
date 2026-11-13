@@ -1,1 +1,4 @@
 /target
+oracle/
+vendor/
+rea/compare/*.json

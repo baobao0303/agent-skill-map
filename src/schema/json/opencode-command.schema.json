@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skill-map.ai/providers/opencode/v1/frontmatter/command.schema.json",
+  "title": "FrontmatterOpenCodeCommand",
+  "description": "Frontmatter shape for nodes classified as `command` by the OpenCode Provider. OpenCode custom commands live as markdown files under `.opencode/commands/<name>.md` (https://opencode.ai/docs/commands); the markdown body is the command template and the filename stem is the command name (invoked `/<name>`). No required fields beyond the base (OpenCode treats the frontmatter as optional metadata); `additionalProperties: true` lets inherited keys flow through unchanged.",
+  "allOf": [
+    { "$ref": "https://skill-map.ai/spec/v1/frontmatter/base.schema.json" }
+  ],
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "description": {
+      "type": "string",
+      "description": "Brief explanation of the command's purpose, shown in OpenCode's slash-command picker."
+    },
+    "agent": {
+      "type": "string",
+      "description": "Optional agent this command runs under (matches an `.opencode/agent/<name>` handle)."
+    },
+    "model": {
+      "type": "string",
+      "description": "Optional model override for this command, in OpenCode's `provider/model` form."
+    }
+  }
+}

@@ -1,0 +1,17 @@
+identity:
+  path: .claude/agents/content-editor.md
+  bodyHash: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  frontmatterHash: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+annotations:
+  version: 2
+  stability: stable
+  tags:
+    - harness
+    - content
+    - frontend
+settings: {}
+audit:
+  createdAt: '2026-02-20T09:00:00.000Z'
+  createdBy: cli
+  lastBumpedAt: '2026-04-30T15:00:00.000Z'
+  lastBumpedBy: cli

@@ -1,0 +1,9 @@
+annotations:
+  tags:
+    - harness
+    - deploy
+    - ci
+identity:
+  bodyHash: 24a1903e0f76651ad6e177ad5c7481b7ae451d9d72ac9b2fb2d860ca961cdc6d
+  frontmatterHash: 3fa592383d48d96218979ae6786a03a3bada12153ca29678b71b91eea502695b
+  path: .claude/commands/publish.md
