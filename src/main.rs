@@ -1,8 +1,10 @@
 mod canon_yaml;
 mod frontmatter;
 mod jsjson;
+mod mask;
 mod norm;
+mod tokens;
 
 fn main() {
-    println!("skflow");
+    println!("agent-skill-map");
 }
