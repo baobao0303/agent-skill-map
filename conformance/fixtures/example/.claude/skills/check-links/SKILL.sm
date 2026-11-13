@@ -1,0 +1,9 @@
+annotations:
+  tags:
+    - harness
+    - links
+    - quality
+identity:
+  bodyHash: a1b36960a6214519ef8f72d32ea296c07e17e4b1d06a3efc326066895537134b
+  frontmatterHash: 220822c755b2e7aadf653de25ffab6b0acb86ca198513100642da15ced531e1e
+  path: .claude/skills/check-links/SKILL.md
