@@ -2,7 +2,10 @@
 //! skill-map's CLI contract (spec_doc §18) so both binaries can run the same
 //! conformance scenarios.
 
+use crate::findings;
+use crate::history;
 use crate::model::{Issue, ScanResult};
+use crate::record;
 use crate::scope::Scope;
 use crate::{format, jsjson, provider, scan, store};
 use clap::{Args, Parser, Subcommand};
@@ -138,6 +141,12 @@ pub enum Command {
         #[arg(long, default_value = "ascii")]
         format: String,
     },
+    /// Close a running job with success or failure. Nonce is the sole credential.
+    Record(record::RecordArgs),
+    /// Print stored probabilistic findings (finder judgments + kernel safety rows).
+    Findings(findings::FindingsArgs),
+    /// Filter execution records.
+    History(history::HistoryArgs),
 }
 
 #[derive(Subcommand)]
@@ -433,6 +442,9 @@ pub fn dispatch(cli: &Cli) -> Result<u8, CliError> {
         ),
         Command::List { kind } => list(cli, &scope, kind.as_deref()),
         Command::Graph { format } => graph(cli, &scope, format),
+        Command::Record(args) => record::run(cli, &scope, &db_path(cli, &scope), args),
+        Command::Findings(args) => findings::run(cli, &scope, &db_path(cli, &scope), args),
+        Command::History(args) => history::run(cli, &scope, &db_path(cli, &scope), args),
     }
 }
 
