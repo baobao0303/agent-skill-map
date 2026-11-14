@@ -3,6 +3,7 @@
 //! conformance scenarios.
 
 use crate::config;
+use crate::conformance;
 use crate::enrich;
 use crate::findings;
 use crate::history;
@@ -156,6 +157,8 @@ pub enum Command {
     Plugins(plugins::PluginsArgs),
     /// Refresh enrichment rows.
     Enrich(enrich::EnrichArgs),
+    /// Run the spec conformance suite.
+    Conformance(conformance::ConformanceArgs),
 }
 
 #[derive(Subcommand)]
@@ -457,6 +460,7 @@ pub fn dispatch(cli: &Cli) -> Result<u8, CliError> {
         Command::Config(args) => config::run(cli, &scope, args),
         Command::Plugins(args) => plugins::run(cli, &scope, args),
         Command::Enrich(args) => enrich::run(cli, &scope, args),
+        Command::Conformance(args) => conformance::run(cli, &scope, args),
     }
 }
 

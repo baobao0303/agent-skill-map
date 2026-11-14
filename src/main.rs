@@ -5,6 +5,7 @@ mod canon_yaml;
 mod catalog;
 mod cli;
 mod config;
+mod conformance;
 mod diagnose;
 mod enrich;
 mod extract;
@@ -46,7 +47,11 @@ fn main() -> ExitCode {
         Ok(code) => code,
         Err(e) => {
             match &e {
-                cli::CliError::Raw(m, _) => eprintln!("{m}"),
+                cli::CliError::Raw(m, _) => {
+                    if !m.is_empty() {
+                        eprintln!("{m}");
+                    }
+                }
                 _ => eprintln!("✕  {}", e.message()),
             }
             e.exit_code()
