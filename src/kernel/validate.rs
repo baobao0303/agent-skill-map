@@ -11,7 +11,7 @@ use std::sync::LazyLock;
 
 macro_rules! schemas {
     ($($file:literal),* $(,)?) => {
-        [$(include_str!(concat!("schema/json/", $file))),*]
+        [$(include_str!(concat!("../schema/json/", $file))),*]
     };
 }
 

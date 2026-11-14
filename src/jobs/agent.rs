@@ -9,11 +9,11 @@ use std::path::{Path, PathBuf};
 
 const SKILL_DIR: &str = "sm-process-jobs";
 const FILES: [(&str, &str); 3] = [
-    ("SKILL.md", include_str!("schema/agent-skill/SKILL.md")),
-    ("mcp.md", include_str!("schema/agent-skill/mcp.md")),
-    ("cli.md", include_str!("schema/agent-skill/cli.md")),
+    ("SKILL.md", include_str!("../schema/agent-skill/SKILL.md")),
+    ("mcp.md", include_str!("../schema/agent-skill/mcp.md")),
+    ("cli.md", include_str!("../schema/agent-skill/cli.md")),
 ];
-const GENERATED_GITIGNORE: &str = include_str!("schema/agent-skill/generated.gitignore");
+const GENERATED_GITIGNORE: &str = include_str!("../schema/agent-skill/generated.gitignore");
 
 /// Providers with a scaffold skill directory: (id, skillDir, marker).
 pub const TARGETS: [(&str, &str, Option<&str>); 5] = [

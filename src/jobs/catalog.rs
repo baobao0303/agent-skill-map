@@ -12,7 +12,7 @@ use serde_json::Value;
 use std::sync::LazyLock;
 
 pub static BUILT_INS: LazyLock<Vec<Value>> =
-    LazyLock::new(|| serde_json::from_str(include_str!("schema/catalog.json")).expect("bundled catalog"));
+    LazyLock::new(|| serde_json::from_str(include_str!("../schema/catalog.json")).expect("bundled catalog"));
 
 #[derive(Clone)]
 pub struct Ext {

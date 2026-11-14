@@ -9,7 +9,7 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-pub const BUNDLED_IGNORE: &str = include_str!("schema/skillmapignore");
+pub const BUNDLED_IGNORE: &str = include_str!("../schema/skillmapignore");
 
 pub struct IgnoreLayers<'a> {
     pub gitignore: Option<&'a str>,

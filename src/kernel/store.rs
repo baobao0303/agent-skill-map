@@ -10,7 +10,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-const DDL: &str = include_str!("schema/001_initial.sql");
+const DDL: &str = include_str!("../schema/001_initial.sql");
 
 /// sha256 over `version \0 description \0 byteLength \0` + sql, per migration.
 pub fn schema_fingerprint() -> String {

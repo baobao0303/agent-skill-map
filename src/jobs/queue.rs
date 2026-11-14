@@ -12,10 +12,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Map, Value, json};
 use std::path::Path;
 
-const PREAMBLE: &str = include_str!("schema/spec/preamble-v2.txt");
-const REPORT_BASE: &str = include_str!("schema/spec/report-base.schema.json");
-const SUMMARY_MARKDOWN: &str = include_str!("schema/spec/summaries/markdown.schema.json");
-const FINDINGS_REPORT: &str = include_str!("schema/spec/findings/report.schema.json");
+const PREAMBLE: &str = include_str!("../schema/spec/preamble-v2.txt");
+const REPORT_BASE: &str = include_str!("../schema/spec/report-base.schema.json");
+const SUMMARY_MARKDOWN: &str = include_str!("../schema/spec/summaries/markdown.schema.json");
+const FINDINGS_REPORT: &str = include_str!("../schema/spec/findings/report.schema.json");
 const NUL: &str = "\0";
 
 fn op(e: impl std::fmt::Display) -> CliError {
