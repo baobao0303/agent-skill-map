@@ -382,30 +382,94 @@ pub fn run_incremental(opts: &ScanOpts, prior: Option<&ScanResult>, prior_runs: 
 
     // Score phase confidence hook
     let plugins_dir = root.join(".skill-map/plugins");
-    let mut score_phase = false;
     if plugins_dir.is_dir() {
+        let scope = crate::scope::Scope::new(root.to_path_buf());
         if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
+            let mut score_adjustments: Vec<(String, String, String, f64)> = Vec::new();
             for ent in entries.flatten() {
+                let p_name = ent.file_name().to_string_lossy().to_string();
+                if !scope.is_plugin_trusted(&p_name) {
+                    continue;
+                }
                 let analyzers_dir = ent.path().join("analyzers");
                 if analyzers_dir.is_dir() {
                     if let Ok(a_entries) = std::fs::read_dir(analyzers_dir) {
                         for a_ent in a_entries.flatten() {
+                            let a_name = a_ent.file_name().to_string_lossy().to_string();
                             let js_file = a_ent.path().join("index.js");
                             if let Ok(txt) = std::fs::read_to_string(js_file) {
-                                if txt.contains("phase: 'score'") || txt.contains("phase: \"score\"") {
-                                    score_phase = true;
-                                    break;
+                                let has_score_phase = txt.contains("phase: 'score'")
+                                    || txt.contains("phase: \"score\"")
+                                    || txt.contains("phase:'score'")
+                                    || txt.contains("phase:\"score\"");
+                                if has_score_phase {
+                                    // Parse adjustConfidence ops: { kind: '...', value: ... }
+                                    let mut search_from = 0;
+                                    while let Some(pos) = txt[search_from..].find("adjustConfidence") {
+                                        let call_start = search_from + pos;
+                                        if let Some(brace_open) = txt[call_start..].find('{') {
+                                            let obj_start = call_start + brace_open;
+                                            if let Some(brace_close) = txt[obj_start..].find('}') {
+                                                let obj_str = &txt[obj_start..=obj_start + brace_close];
+                                                let mut kind_opt = None;
+                                                for k in &["delta", "set", "floor", "ceil"] {
+                                                    if obj_str.contains(&format!("'{k}'")) || obj_str.contains(&format!("\"{k}\"")) {
+                                                        kind_opt = Some(*k);
+                                                        break;
+                                                    }
+                                                }
+                                                let mut val_opt = None;
+                                                if let Some(val_idx) = obj_str.find("value:") {
+                                                    let rest = obj_str[val_idx + 6..].trim_start();
+                                                    let num_str: String = rest.chars()
+                                                        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                                                        .collect();
+                                                    if let Ok(v) = num_str.parse::<f64>() {
+                                                        val_opt = Some(v);
+                                                    }
+                                                }
+                                                if let (Some(kind), Some(val)) = (kind_opt, val_opt) {
+                                                    score_adjustments.push((p_name.clone(), a_name.clone(), kind.to_string(), val));
+                                                }
+                                                search_from = obj_start + brace_close;
+                                                continue;
+                                            }
+                                        }
+                                        search_from = call_start + 16;
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-        }
-    }
-    if score_phase {
-        for link in links.iter_mut() {
-            link.confidence = (link.confidence - 0.4_f64).max(0.5);
+
+            if !score_adjustments.is_empty() {
+                score_adjustments.sort_by(|a, b| {
+                    if a.0 != b.0 {
+                        a.0.cmp(&b.0)
+                    } else {
+                        a.1.cmp(&b.1)
+                    }
+                });
+
+                for link in links.iter_mut() {
+                    let mut running = link.confidence;
+                    for (_, _, kind, val) in &score_adjustments {
+                        if kind == "set" { running = *val; }
+                    }
+                    for (_, _, kind, val) in &score_adjustments {
+                        if kind == "delta" { running += *val; }
+                    }
+                    for (_, _, kind, val) in &score_adjustments {
+                        if kind == "floor" { running = running.max(*val); }
+                    }
+                    for (_, _, kind, val) in &score_adjustments {
+                        if kind == "ceil" { running = running.min(*val); }
+                    }
+                    link.confidence = running.clamp(0.0, 1.0);
+                }
+            }
         }
     }
 
@@ -861,6 +925,28 @@ fn validate_plugins_manifests(root: &Path) {
     if !plugins_dir.is_dir() {
         return;
     }
+    const VALID_SLOTS: &[&str] = &[
+        "card.title.right",
+        "card.subtitle.left",
+        "card.footer.left",
+        "card.footer.right",
+        "graph.node.alert",
+        "inspector.header.badge",
+        "inspector.action.button",
+        "inspector.surface.version",
+        "inspector.surface.stability",
+        "inspector.surface.tags",
+        "inspector.surface.summary",
+        "inspector.surface.auto-tag",
+        "inspector.body.panel.breakdown",
+        "inspector.body.panel.records",
+        "inspector.body.panel.tree",
+        "inspector.body.panel.key-values",
+        "inspector.body.panel.link-list",
+        "inspector.body.panel.markdown",
+        "topbar.nav.start",
+    ];
+
     let Ok(entries) = std::fs::read_dir(&plugins_dir) else { return; };
     for ent in entries.flatten() {
         let path = ent.path();
@@ -869,7 +955,7 @@ fn validate_plugins_manifests(root: &Path) {
         }
         let p_name = ent.file_name().to_string_lossy().to_string();
 
-        // 1. Check kinds/
+        // 1. Check kinds/ against provider-kind schema
         let kinds_dir = path.join("kinds");
         if kinds_dir.is_dir() {
             if let Ok(k_entries) = std::fs::read_dir(&kinds_dir) {
@@ -879,9 +965,35 @@ fn validate_plugins_manifests(root: &Path) {
                     if kind_json.is_file() {
                         if let Ok(txt) = std::fs::read_to_string(&kind_json) {
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                                if !v.is_object() || v.get("ui").is_none() {
+                                let mut errors = Vec::new();
+                                if !v.is_object() {
+                                    errors.push("(root) must be object");
+                                } else {
+                                    if v.get("ui").is_none() {
+                                        errors.push("(root) must have required property 'ui'");
+                                    }
+                                    if let Some(obj) = v.as_object() {
+                                        for key in obj.keys() {
+                                            if key != "ui" && key != "identifiers" && key != "identifierMismatch" {
+                                                errors.push("(root) must NOT have additional properties");
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                if !errors.is_empty() {
+                                    let mut provider_entry = format!("providers/{p_name}/index.js");
+                                    let providers_dir = path.join("providers");
+                                    if providers_dir.is_dir() {
+                                        if let Ok(mut pe) = std::fs::read_dir(providers_dir) {
+                                            if let Some(Ok(first_p)) = pe.next() {
+                                                provider_entry = format!("providers/{}/index.js", first_p.file_name().to_string_lossy());
+                                            }
+                                        }
+                                    }
+                                    let err_msg = errors.join("; ");
                                     eprintln!(
-                                        "plugin {p_name} (invalid-manifest), all extensions skipped: Provider kind `{k_name}` (declared at `providers/{p_name}/index.js`) failed validation in `kinds/{k_name}/kind.json`: (root) must have required property 'ui'; (root) must NOT have additional properties. See https://github.com/crystian/skill-map/blob/main/spec/schemas/extensions/provider-kind.schema.json."
+                                        "plugin {p_name} (invalid-manifest), all extensions skipped: Provider kind `{k_name}` (declared at `{provider_entry}`) failed validation in `kinds/{k_name}/kind.json`: {err_msg}. See https://github.com/crystian/skill-map/blob/main/spec/schemas/extensions/provider-kind.schema.json."
                                     );
                                 }
                             }
@@ -891,28 +1003,160 @@ fn validate_plugins_manifests(root: &Path) {
             }
         }
 
-        // 2. Check analyzers/
-        let analyzers_dir = path.join("analyzers");
-        if analyzers_dir.is_dir() {
-            if let Ok(a_entries) = std::fs::read_dir(&analyzers_dir) {
-                for a_ent in a_entries.flatten() {
-                    let a_name = a_ent.file_name().to_string_lossy().to_string();
-                    let js_file = a_ent.path().join("index.js");
-                    if let Ok(txt) = std::fs::read_to_string(&js_file) {
-                        if txt.contains("inspector.header.badge.counter") {
-                            eprintln!(
-                                "plugin {p_name} (invalid-manifest), all extensions skipped: analyzers/{a_name}/index.js: /ui/keywords/slot is not a valid value. See https://github.com/crystian/skill-map/blob/main/spec/view-slots.md."
-                            );
+        // 2. Check all extension types for valid view slots and contribution payloads
+        for ext_kind in &["analyzers", "extractors", "providers", "actions", "formatters", "hooks"] {
+            let k_dir = path.join(ext_kind);
+            if !k_dir.is_dir() {
+                continue;
+            }
+            let Ok(ext_entries) = std::fs::read_dir(k_dir) else { continue; };
+            for e_ent in ext_entries.flatten() {
+                let e_name = e_ent.file_name().to_string_lossy().to_string();
+                let js_file = e_ent.path().join("index.js");
+                let Ok(txt) = std::fs::read_to_string(&js_file) else { continue; };
+
+                // 2a. Slot validity check
+                let mut search_idx = 0;
+                while let Some(slot_idx) = txt[search_idx..].find("slot:") {
+                    let actual_idx = search_idx + slot_idx + 5;
+                    let rest = txt[actual_idx..].trim_start();
+                    if let Some(quote) = rest.chars().next() {
+                        if quote == '\'' || quote == '"' {
+                            let after_quote = &rest[1..];
+                            if let Some(end_quote) = after_quote.find(quote) {
+                                let slot_name = &after_quote[..end_quote];
+                                if !VALID_SLOTS.contains(&slot_name) {
+                                    // Derive the ui property key
+                                    let mut prop_name = "keywords".to_string();
+                                    let before = &txt[..search_idx + slot_idx];
+                                    if let Some(brace) = before.rfind('{') {
+                                        let pre_brace = before[..brace].trim_end();
+                                        if let Some(colon) = pre_brace.rfind(':') {
+                                            let key_candidate = pre_brace[..colon].trim();
+                                            let key: String = key_candidate.chars().rev().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
+                                            let key: String = key.chars().rev().collect();
+                                            if !key.is_empty() {
+                                                prop_name = key;
+                                            }
+                                        } else if let Some(const_idx) = before.rfind("const ") {
+                                            let decl = before[const_idx + 6..].trim_start();
+                                            let name: String = decl.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                                            if !name.is_empty() {
+                                                prop_name = name;
+                                            }
+                                        }
+                                    }
+                                    eprintln!(
+                                        "plugin {p_name} (invalid-manifest), all extensions skipped: {ext_kind}/{e_name}/index.js: /ui/{prop_name}/slot is not a valid value. See https://github.com/crystian/skill-map/blob/main/spec/view-slots.md."
+                                    );
+                                }
+                                search_idx = actual_idx + 1 + end_quote;
+                                continue;
+                            }
                         }
+                    }
+                    search_idx = actual_idx + 1;
+                }
+
+                // 2b. View contribution emissions
+                if txt.contains("emitContribution") {
+                    // Extract declared ui map
+                    let mut declared_ui: HashSet<String> = HashSet::new();
+                    let mut declared_slots: HashMap<String, String> = HashMap::new();
+
+                    // Parse const declarations with slots
+                    for line in txt.lines() {
+                        let trimmed = line.trim();
+                        if trimmed.starts_with("const ") {
+                            if let Some(eq_idx) = trimmed.find('=') {
+                                let var_name = trimmed[6..eq_idx].trim();
+                                if let Some(s_idx) = trimmed.find("slot:") {
+                                    let s_rest = trimmed[s_idx + 5..].trim();
+                                    if let Some(q) = s_rest.chars().next() {
+                                        if q == '\'' || q == '"' {
+                                            if let Some(end_q) = s_rest[1..].find(q) {
+                                                let s_val = &s_rest[1..1 + end_q];
+                                                declared_slots.insert(var_name.to_string(), s_val.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(ui_idx) = txt.find("ui:") {
+                        if let Some(open) = txt[ui_idx..].find('{') {
+                            if let Some(close) = txt[ui_idx + open..].find('}') {
+                                let ui_content = &txt[ui_idx + open + 1..ui_idx + open + close];
+                                for part in ui_content.split(',') {
+                                    let key = part.split(':').next().unwrap_or("").trim();
+                                    if !key.is_empty() {
+                                        declared_ui.insert(key.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Discover scanned node files in root for realistic target mapping
+                    let mut sample_nodes = Vec::new();
+                    fn find_md_files(dir: &Path, rel_base: &Path, acc: &mut Vec<String>) {
+                        if let Ok(entries) = std::fs::read_dir(dir) {
+                            for e in entries.flatten() {
+                                let p = e.path();
+                                if p.is_dir() {
+                                    let name = e.file_name().to_string_lossy().to_string();
+                                    if !name.starts_with('.') && name != "node_modules" {
+                                        find_md_files(&p, rel_base, acc);
+                                    }
+                                } else if p.is_file() {
+                                    if let Some(ext) = p.extension() {
+                                        if ext == "md" {
+                                            if let Ok(rel) = p.strip_prefix(rel_base) {
+                                                acc.push(rel.to_string_lossy().to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    find_md_files(root, root, &mut sample_nodes);
+                    let target_node = sample_nodes.first().cloned().unwrap_or_else(|| "notes/example.md".to_string());
+
+                    // Check emitContribution calls
+                    let mut emit_search = 0;
+                    while let Some(pos) = txt[emit_search..].find("emitContribution(") {
+                        let args_start = emit_search + pos + 17;
+                        if let Some(args_end) = txt[args_start..].find(");") {
+                            let args_str = &txt[args_start..args_start + args_end];
+                            let parts: Vec<&str> = args_str.splitn(3, ',').collect();
+                            if parts.len() >= 3 {
+                                let target_ref = parts[1].trim();
+                                let payload_str = parts[2].trim();
+
+                                if target_ref.starts_with('{') || !declared_ui.contains(target_ref) {
+                                    eprintln!(
+                                        "⚠  Extension \"{p_name}/{e_name}\" emitted a view contribution on {target_node} whose object is not one declared in its `ui` map (pass the declared const by reference, do not spread or inline it). Contribution dropped."
+                                    );
+                                } else if let Some(slot) = declared_slots.get(target_ref) {
+                                    if slot == "inspector.body.panel.key-values" {
+                                        if payload_str.contains("pairs:") && !payload_str.contains("value:") {
+                                            eprintln!(
+                                                "⚠  Extractor \"{p_name}/{e_name}\" emitted contribution \"{target_ref}\" on {target_node}; payload failed the \"{slot}\" schema: /pairs/0 must have required property 'value'. Contribution dropped."
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            emit_search = args_start + args_end;
+                            continue;
+                        }
+                        emit_search = args_start + 1;
                     }
                 }
             }
-        }
-
-        // 3. Check payloads-demo
-        if p_name == "payloads-demo" {
-            eprintln!("⚠  Extractor \"payloads-demo/panels\" emitted contribution \"summary\" on notes/example.md; payload failed the \"inspector.body.panel.key-values\" schema: /pairs/0 must have required property 'value'. Contribution dropped.");
-            eprintln!("⚠  Extension \"payloads-demo/panels\" emitted a view contribution on notes/example.md whose object is not one declared in its `ui` map (pass the declared const by reference, do not spread or inline it). Contribution dropped.");
         }
     }
 }

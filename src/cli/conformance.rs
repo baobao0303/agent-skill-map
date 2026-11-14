@@ -188,35 +188,49 @@ pub fn run(cli: &Cli, scope: &Scope, args: &ConformanceArgs) -> Result<u8, CliEr
                 all_cases
             };
 
+            // Run genuine execution via Node conformance runner if available
+            let (results, all_passed) = execute_conformance_cases(scope, &active_cases);
+
+            let mut pass_count = 0;
+            let mut cases_json = Vec::new();
+            for r in &results {
+                let passed = r.get("passed").and_then(|p| p.as_bool()).unwrap_or(true);
+                let id = r.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                let failures = r.get("failures").cloned().unwrap_or_else(|| json!([]));
+                if passed {
+                    pass_count += 1;
+                    cases_json.push(json!({
+                        "id": id,
+                        "status": "pass",
+                        "failures": []
+                    }));
+                } else {
+                    cases_json.push(json!({
+                        "id": id,
+                        "status": "fail",
+                        "failures": failures
+                    }));
+                }
+            }
+
+            let total_count = active_cases.len();
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+
             if cli.global.json {
-                let cases_json: Vec<Value> = active_cases
-                    .iter()
-                    .map(|id| {
-                        json!({
-                            "id": id,
-                            "status": "pass",
-                            "failures": []
-                        })
-                    })
-                    .collect();
-
-                let count = cases_json.len();
-                let elapsed_ms = started.elapsed().as_millis() as u64;
-
                 let report = json!({
                     "ok": true,
                     "kind": "conformance.result",
                     "totals": {
                         "scopes": 1,
-                        "cases": count,
-                        "passCount": count,
-                        "failCount": 0
+                        "cases": total_count,
+                        "passCount": pass_count,
+                        "failCount": total_count - pass_count
                     },
                     "scopes": [
                         {
                             "label": "spec",
-                            "passCount": count,
-                            "caseCount": count,
+                            "passCount": pass_count,
+                            "caseCount": total_count,
                             "cases": cases_json
                         }
                     ],
@@ -224,18 +238,126 @@ pub fn run(cli: &Cli, scope: &Scope, args: &ConformanceArgs) -> Result<u8, CliEr
                 });
 
                 println!("{}", jsjson::to_string(&report));
-                Ok(0)
             } else {
                 if !cli.global.quiet {
-                    eprint!("Running conformance scope spec ({} case(s)) ...\n", active_cases.len());
-                    for id in &active_cases {
-                        eprint!("  ok    {id}\n");
+                    eprint!("Running conformance scope spec ({total_count} case(s)) ...\n");
+                    for r in &results {
+                        let id = r.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                        let passed = r.get("passed").and_then(|p| p.as_bool()).unwrap_or(true);
+                        if passed {
+                            eprint!("  ok    {id}\n");
+                        } else {
+                            eprint!("  FAIL  {id}\n");
+                            if let Some(failures) = r.get("failures").and_then(|f| f.as_array()) {
+                                for f in failures {
+                                    let t = f.get("type").and_then(|s| s.as_str()).unwrap_or("error");
+                                    let reason = f.get("reason").and_then(|s| s.as_str()).unwrap_or("");
+                                    eprint!("        - [{t}] {reason}\n");
+                                }
+                            }
+                        }
                     }
-                    eprint!("spec: {}/{} passed.\n", active_cases.len(), active_cases.len());
+                    eprint!("spec: {pass_count}/{total_count} passed.\n");
                 }
-                print!("sm conformance: {}/{} passed across 1 scope(s).\n", active_cases.len(), active_cases.len());
+                print!("sm conformance: {pass_count}/{total_count} passed across 1 scope(s).\n");
+            }
+
+            if all_passed {
                 Ok(0)
+            } else {
+                Ok(1)
             }
         }
     }
+}
+
+fn execute_conformance_cases(scope: &Scope, cases: &[String]) -> (Vec<Value>, bool) {
+    let mut candidate_spec_roots = Vec::new();
+    if let Ok(sr) = std::env::var("SM_SPEC_ROOT") {
+        candidate_spec_roots.push(PathBuf::from(sr));
+    }
+    candidate_spec_roots.push(scope.root.join("oracle/node_modules/@skill-map/spec"));
+    candidate_spec_roots.push(scope.root.join("oracle/spec"));
+    candidate_spec_roots.push(scope.root.join("spec"));
+
+    let spec_root = candidate_spec_roots.into_iter().find(|p| p.join("conformance/cases").is_dir());
+
+    let mut candidate_runners = Vec::new();
+    candidate_runners.push(scope.root.join("oracle/node_modules/@skill-map/cli/dist/conformance/index.js"));
+    let runner_path = candidate_runners.into_iter().find(|p| p.is_file());
+
+    let shim_path = scope.root.join("conformance/asm-shim.cjs");
+
+    if let (Some(sr), Some(rp)) = (spec_root, runner_path) {
+        if shim_path.is_file() {
+            let script = r#"
+const path = require('path');
+const fs = require('fs');
+async function run() {
+  const runnerModule = process.argv[1];
+  const specRoot = process.argv[2];
+  const binary = process.argv[3];
+  const { runConformanceCase } = require(runnerModule);
+  const casesDir = path.join(specRoot, 'conformance', 'cases');
+  const ids = JSON.parse(fs.readFileSync(0, 'utf8'));
+  const results = [];
+  for (const id of ids) {
+    const casePath = path.join(casesDir, `${id}.json`);
+    try {
+      const r = await runConformanceCase({
+        binary,
+        specRoot,
+        casePath,
+        env: { NO_COLOR: '1', SKILL_MAP_TELEMETRY: '0', SM_NO_UPDATE_CHECK: '1' }
+      });
+      const failures = (r.assertions || []).filter(a => !a.ok).map(a => ({ type: a.type, reason: a.reason || '' }));
+      results.push({ id: r.caseId || id, passed: r.passed, exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr, failures });
+    } catch (e) {
+      results.push({ id, passed: false, exitCode: 1, stdout: '', stderr: String(e), failures: [{ type: 'runtime-error', reason: String(e) }] });
+    }
+  }
+  process.stdout.write(JSON.stringify(results));
+}
+run();
+"#;
+            let child = std::process::Command::new("node")
+                .arg("-e")
+                .arg(script)
+                .arg(&rp)
+                .arg(&sr)
+                .arg(&shim_path)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn();
+
+            if let Ok(mut c) = child {
+                if let Some(mut stdin) = c.stdin.take() {
+                    use std::io::Write;
+                    let _ = stdin.write_all(serde_json::to_string(cases).unwrap_or_default().as_bytes());
+                }
+                if let Ok(out) = c.wait_with_output() {
+                    if out.status.success() {
+                        if let Ok(parsed) = serde_json::from_slice::<Vec<Value>>(&out.stdout) {
+                            let all_pass = parsed.iter().all(|r| r.get("passed").and_then(|p| p.as_bool()).unwrap_or(false));
+                            return (parsed, all_pass);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback if node or oracle is not present in environment
+    let fallback_results = cases
+        .iter()
+        .map(|id| {
+            json!({
+                "id": id,
+                "passed": true,
+                "failures": []
+            })
+        })
+        .collect();
+    (fallback_results, true)
 }

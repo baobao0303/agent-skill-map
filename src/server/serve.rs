@@ -101,14 +101,17 @@ pub fn run(
 
     let db_path = scope.db_path();
     let scope_root = scope.root.clone();
+    let dev_cors = args.dev;
+    let s_token = token.clone();
 
     while running.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => {
                 let db_p = db_path.clone();
                 let s_root = scope_root.clone();
+                let tok = s_token.clone();
                 std::thread::spawn(move || {
-                    handle_connection(stream, &db_p, &s_root);
+                    handle_connection(stream, &db_p, &s_root, &tok, dev_cors);
                 });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -124,7 +127,13 @@ pub fn run(
     Ok(0)
 }
 
-fn handle_connection(mut stream: TcpStream, db_path: &Path, scope_root: &Path) {
+fn handle_connection(
+    mut stream: TcpStream,
+    db_path: &Path,
+    scope_root: &Path,
+    server_token: &str,
+    dev_cors: bool,
+) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
 
@@ -142,10 +151,14 @@ fn handle_connection(mut stream: TcpStream, db_path: &Path, scope_root: &Path) {
     let uri = parts[1];
 
     // Read remaining headers until blank line
+    let mut headers = HashMap::new();
     let mut header_line = String::new();
     while let Ok(n) = reader.read_line(&mut header_line) {
         if n == 0 || header_line == "\r\n" || header_line == "\n" {
             break;
+        }
+        if let Some((k, v)) = header_line.split_once(':') {
+            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
         }
         header_line.clear();
     }
@@ -153,34 +166,85 @@ fn handle_connection(mut stream: TcpStream, db_path: &Path, scope_root: &Path) {
     let stream = reader.into_inner();
 
     if method == "OPTIONS" {
-        send_options_response(stream);
-        return;
-    }
-
-    if method != "GET" {
-        send_json_response(stream, 404, "Not Found", &json!({"ok": false, "error": "not found"}));
+        send_options_response(stream, dev_cors);
         return;
     }
 
     let path = uri.split('?').next().unwrap_or(uri);
 
-    if path == "/api/health" {
-        send_json_response(stream, 200, "OK", &json!({"ok": true, "status": "healthy"}));
-    } else if path == "/api/nodes" {
-        let resp = build_nodes_response(db_path);
-        send_json_response(stream, 200, "OK", &resp);
-    } else if let Some(rest) = path.strip_prefix("/api/nodes/") {
-        if let Some(b64) = rest.strip_suffix("/prob-extensions") {
-            handle_prob_extensions(stream, db_path, scope_root, b64);
+    // Enforce token for mutating API operations
+    if (method == "POST" || method == "PUT" || method == "DELETE") && path.starts_with("/api/") {
+        let presented = headers.get("x-skill-map-token");
+        let token_ok = match presented {
+            Some(t) => t == server_token,
+            None => false,
+        };
+        if !token_ok {
+            send_json_response(
+                stream,
+                403,
+                "Forbidden",
+                &json!({
+                    "ok": false,
+                    "error": {
+                        "code": "forbidden",
+                        "message": "Invalid or missing x-skill-map-token header."
+                    }
+                }),
+                dev_cors,
+            );
+            return;
+        }
+    }
+
+    if method == "GET" {
+        if path == "/api/health" {
+            send_json_response(stream, 200, "OK", &json!({"ok": true, "status": "healthy"}), dev_cors);
+        } else if path == "/api/nodes" {
+            let resp = build_nodes_response(db_path);
+            send_json_response(stream, 200, "OK", &resp, dev_cors);
+        } else if let Some(rest) = path.strip_prefix("/api/nodes/") {
+            if let Some(b64) = rest.strip_suffix("/prob-extensions") {
+                handle_prob_extensions(stream, db_path, scope_root, b64, dev_cors);
+            } else {
+                handle_single_node(stream, db_path, scope_root, rest, dev_cors);
+            }
+        } else if path == "/api/links" {
+            let resp = build_links_response(db_path);
+            send_json_response(stream, 200, "OK", &resp, dev_cors);
+        } else if path == "/api/issues" {
+            let resp = build_issues_response(db_path);
+            send_json_response(stream, 200, "OK", &resp, dev_cors);
+        } else if path == "/api/config" || path == "/api/config/resolution" {
+            let resp = build_config_response(scope_root);
+            send_json_response(stream, 200, "OK", &resp, dev_cors);
+        } else if path == "/api/plugins" {
+            let resp = build_plugins_response(scope_root);
+            send_json_response(stream, 200, "OK", &resp, dev_cors);
+        } else if path == "/api/jobs" {
+            let resp = build_jobs_response(db_path);
+            send_json_response(stream, 200, "OK", &resp, dev_cors);
+        } else if path == "/api/mcp/status" {
+            send_json_response(
+                stream,
+                200,
+                "OK",
+                &json!({
+                    "schemaVersion": "1",
+                    "enabled": false,
+                    "serverUrl": "http://127.0.0.1/mcp"
+                }),
+                dev_cors,
+            );
         } else {
-            send_json_response(stream, 404, "Not Found", &json!({"ok": false, "error": "not found"}));
+            send_json_response(stream, 404, "Not Found", &json!({"ok": false, "error": "not found"}), dev_cors);
         }
     } else {
-        send_json_response(stream, 404, "Not Found", &json!({"ok": false, "error": "not found"}));
+        send_json_response(stream, 404, "Not Found", &json!({"ok": false, "error": "not found"}), dev_cors);
     }
 }
 
-fn handle_prob_extensions(stream: &mut TcpStream, db_path: &Path, scope_root: &Path, path_b64: &str) {
+fn handle_prob_extensions(stream: &mut TcpStream, db_path: &Path, scope_root: &Path, path_b64: &str, dev_cors: bool) {
     let node_path = match decode_base64(path_b64) {
         Some(p) => p,
         None => {
@@ -195,6 +259,7 @@ fn handle_prob_extensions(stream: &mut TcpStream, db_path: &Path, scope_root: &P
                         "message": format!("Invalid base64 path: {path_b64}")
                     }
                 }),
+                dev_cors,
             );
             return;
         }
@@ -227,6 +292,7 @@ fn handle_prob_extensions(stream: &mut TcpStream, db_path: &Path, scope_root: &P
                     "message": format!("Node not found: {node_path}")
                 }
             }),
+            dev_cors,
         );
         return;
     }
@@ -318,7 +384,459 @@ fn handle_prob_extensions(stream: &mut TcpStream, db_path: &Path, scope_root: &P
         "contributionsRegistry": contributions_registry()
     });
 
-    send_json_response(stream, 200, "OK", &envelope);
+    send_json_response(stream, 200, "OK", &envelope, dev_cors);
+}
+
+fn handle_single_node(stream: &mut TcpStream, db_path: &Path, _scope_root: &Path, path_b64: &str, dev_cors: bool) {
+    let node_path = match decode_base64(path_b64) {
+        Some(p) => p,
+        None => {
+            send_json_response(
+                stream,
+                404,
+                "Not Found",
+                &json!({
+                    "ok": false,
+                    "error": {
+                        "code": "node-not-found",
+                        "message": format!("Invalid base64 path: {path_b64}")
+                    }
+                }),
+                dev_cors,
+            );
+            return;
+        }
+    };
+
+    let conn = match rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) {
+        Ok(c) => c,
+        Err(_) => {
+            send_json_response(stream, 404, "Not Found", &json!({"ok": false, "error": "database error"}), dev_cors);
+            return;
+        }
+    };
+
+    let row = conn.query_row(
+        "SELECT path, kind, provider, body_hash, frontmatter_hash, bytes_frontmatter, bytes_body, bytes_total, \
+         links_out_count, links_in_count, external_refs_count, frontmatter_json, modified_at_ms, \
+         tokens_frontmatter, tokens_body, tokens_total, sidecar_present, sidecar_status, annotations_json, sidecar_root_json \
+         FROM scan_nodes WHERE path = ?1",
+        [&node_path],
+        |r| {
+            let path: String = r.get(0)?;
+            let kind: String = r.get(1)?;
+            let provider: String = r.get(2)?;
+            let body_hash: String = r.get(3)?;
+            let frontmatter_hash: String = r.get(4)?;
+            let bytes_fm: i64 = r.get(5)?;
+            let bytes_body: i64 = r.get(6)?;
+            let bytes_total: i64 = r.get(7)?;
+            let links_out: i64 = r.get(8)?;
+            let links_in: i64 = r.get(9)?;
+            let ext_refs: i64 = r.get(10)?;
+            let fm_json: Option<String> = r.get(11)?;
+            let modified_at: i64 = r.get(12)?;
+            let tok_fm: Option<i64> = r.get(13)?;
+            let tok_body: Option<i64> = r.get(14)?;
+            let tok_total: Option<i64> = r.get(15)?;
+            let sidecar_present: bool = r.get(16)?;
+            let sidecar_status: Option<String> = r.get(17)?;
+
+            let frontmatter: Value = fm_json
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or(Value::Null);
+
+            let tokens = match (tok_fm, tok_body, tok_total) {
+                (Some(f), Some(b), Some(t)) => json!({
+                    "frontmatter": f,
+                    "body": b,
+                    "total": t
+                }),
+                _ => Value::Null,
+            };
+
+            let sidecar = json!({
+                "present": sidecar_present,
+                "status": sidecar_status.unwrap_or_else(|| "clean".into())
+            });
+
+            Ok(json!({
+                "path": path,
+                "kind": kind,
+                "provider": provider,
+                "bodyHash": body_hash,
+                "frontmatterHash": frontmatter_hash,
+                "bytes": {
+                    "frontmatter": bytes_fm,
+                    "body": bytes_body,
+                    "total": bytes_total
+                },
+                "linksOutCount": links_out,
+                "linksInCount": links_in,
+                "externalRefsCount": ext_refs,
+                "frontmatter": frontmatter,
+                "sidecar": sidecar,
+                "tokens": tokens,
+                "modifiedAtMs": modified_at,
+                "isFavorite": false,
+                "contributions": [],
+                "tags": []
+            }))
+        },
+    );
+
+    let decorated_node = match row {
+        Ok(n) => n,
+        Err(_) => {
+            send_json_response(
+                stream,
+                404,
+                "Not Found",
+                &json!({
+                    "ok": false,
+                    "error": {
+                        "code": "node-not-found",
+                        "message": format!("Node not found: {node_path}")
+                    }
+                }),
+                dev_cors,
+            );
+            return;
+        }
+    };
+
+    let mut incoming_links = Vec::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT source, target, kind, confidence, resolved_target FROM scan_links WHERE resolved_target = ?1 OR target = ?1") {
+        if let Ok(rows) = stmt.query_map([&node_path], |r| {
+            Ok(json!({
+                "source": r.get::<_, String>(0)?,
+                "target": r.get::<_, String>(1)?,
+                "kind": r.get::<_, String>(2)?,
+                "confidence": r.get::<_, f64>(3)?,
+                "resolvedTarget": r.get::<_, Option<String>>(4)?
+            }))
+        }) {
+            for row in rows.flatten() {
+                incoming_links.push(row);
+            }
+        }
+    }
+
+    let mut outgoing_links = Vec::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT source, target, kind, confidence, resolved_target FROM scan_links WHERE source = ?1") {
+        if let Ok(rows) = stmt.query_map([&node_path], |r| {
+            Ok(json!({
+                "source": r.get::<_, String>(0)?,
+                "target": r.get::<_, String>(1)?,
+                "kind": r.get::<_, String>(2)?,
+                "confidence": r.get::<_, f64>(3)?,
+                "resolvedTarget": r.get::<_, Option<String>>(4)?
+            }))
+        }) {
+            for row in rows.flatten() {
+                outgoing_links.push(row);
+            }
+        }
+    }
+
+    let mut issues_list = Vec::new();
+    let pat = format!("%\"{node_path}\"%");
+    if let Ok(mut stmt) = conn.prepare("SELECT analyzer_id, severity, node_ids_json, message, line FROM scan_issues WHERE node_ids_json LIKE ?1") {
+        if let Ok(rows) = stmt.query_map([&pat], |r| {
+            let analyzer_id: String = r.get(0)?;
+            let severity: String = r.get(1)?;
+            let node_ids_json: String = r.get(2)?;
+            let message: String = r.get(3)?;
+            let line: Option<i64> = r.get(4)?;
+            let node_ids: Value = serde_json::from_str(&node_ids_json).unwrap_or(json!([node_path]));
+            let mut obj = json!({
+                "analyzerId": analyzer_id,
+                "severity": severity,
+                "nodeIds": node_ids,
+                "message": message
+            });
+            if let Some(l) = line {
+                obj.as_object_mut().unwrap().insert("line".into(), json!(l));
+            }
+            Ok(obj)
+        }) {
+            for row in rows.flatten() {
+                issues_list.push(row);
+            }
+        }
+    }
+
+    let resp = json!({
+        "schemaVersion": "1",
+        "kind": "node",
+        "item": decorated_node,
+        "links": {
+            "incoming": incoming_links,
+            "outgoing": outgoing_links
+        },
+        "issues": issues_list,
+        "kindRegistry": kind_registry(),
+        "providerRegistry": provider_registry(),
+        "contributionsRegistry": contributions_registry()
+    });
+
+    send_json_response(stream, 200, "OK", &resp, dev_cors);
+}
+
+fn build_links_response(db_path: &Path) -> Value {
+    let conn = match rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) {
+        Ok(c) => c,
+        Err(_) => {
+            return json!({
+                "schemaVersion": "1",
+                "kind": "links",
+                "items": [],
+                "filters": {
+                    "source": Value::Null,
+                    "target": Value::Null,
+                    "kind": Value::Null
+                },
+                "counts": {
+                    "total": 0,
+                    "returned": 0,
+                    "page": { "offset": 0, "limit": 100 }
+                },
+                "kindRegistry": kind_registry(),
+                "providerRegistry": provider_registry(),
+                "contributionsRegistry": contributions_registry()
+            });
+        }
+    };
+
+    let mut items = Vec::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT source, target, kind, confidence, resolved_target FROM scan_links") {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok(json!({
+                "source": r.get::<_, String>(0)?,
+                "target": r.get::<_, String>(1)?,
+                "kind": r.get::<_, String>(2)?,
+                "confidence": r.get::<_, f64>(3)?,
+                "resolvedTarget": r.get::<_, Option<String>>(4)?
+            }))
+        }) {
+            for row in rows.flatten() {
+                items.push(row);
+            }
+        }
+    }
+
+    let total = items.len();
+    json!({
+        "schemaVersion": "1",
+        "kind": "links",
+        "items": items,
+        "filters": {
+            "source": Value::Null,
+            "target": Value::Null,
+            "kind": Value::Null
+        },
+        "counts": {
+            "total": total,
+            "returned": total,
+            "page": { "offset": 0, "limit": 100 }
+        },
+        "kindRegistry": kind_registry(),
+        "providerRegistry": provider_registry(),
+        "contributionsRegistry": contributions_registry()
+    })
+}
+
+fn build_issues_response(db_path: &Path) -> Value {
+    let conn = match rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) {
+        Ok(c) => c,
+        Err(_) => {
+            return json!({
+                "schemaVersion": "1",
+                "kind": "issues",
+                "items": [],
+                "filters": {
+                    "severity": Value::Null,
+                    "analyzer": Value::Null
+                },
+                "counts": {
+                    "total": 0,
+                    "returned": 0,
+                    "page": { "offset": 0, "limit": 100 }
+                },
+                "kindRegistry": kind_registry(),
+                "providerRegistry": provider_registry(),
+                "contributionsRegistry": contributions_registry()
+            });
+        }
+    };
+
+    let mut items = Vec::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT analyzer_id, severity, node_ids_json, message, line FROM scan_issues") {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            let analyzer_id: String = r.get(0)?;
+            let severity: String = r.get(1)?;
+            let node_ids_json: String = r.get(2)?;
+            let message: String = r.get(3)?;
+            let line: Option<i64> = r.get(4)?;
+            let node_ids: Value = serde_json::from_str(&node_ids_json).unwrap_or(json!([]));
+            let mut obj = json!({
+                "analyzerId": analyzer_id,
+                "severity": severity,
+                "nodeIds": node_ids,
+                "message": message
+            });
+            if let Some(l) = line {
+                obj.as_object_mut().unwrap().insert("line".into(), json!(l));
+            }
+            Ok(obj)
+        }) {
+            for row in rows.flatten() {
+                items.push(row);
+            }
+        }
+    }
+
+    let total = items.len();
+    json!({
+        "schemaVersion": "1",
+        "kind": "issues",
+        "items": items,
+        "filters": {
+            "severity": Value::Null,
+            "analyzer": Value::Null
+        },
+        "counts": {
+            "total": total,
+            "returned": total,
+            "page": { "offset": 0, "limit": 100 }
+        },
+        "kindRegistry": kind_registry(),
+        "providerRegistry": provider_registry(),
+        "contributionsRegistry": contributions_registry()
+    })
+}
+
+fn build_config_response(scope_root: &Path) -> Value {
+    let scope = crate::scope::Scope::new(scope_root.to_path_buf());
+    let (config, _) = crate::config::load_config(&scope);
+    json!({
+        "schemaVersion": "1",
+        "kind": "config",
+        "value": config,
+        "kindRegistry": kind_registry(),
+        "providerRegistry": provider_registry(),
+        "contributionsRegistry": contributions_registry()
+    })
+}
+
+fn build_plugins_response(scope_root: &Path) -> Value {
+    let scope = crate::scope::Scope::new(scope_root.to_path_buf());
+    let (built_ins, drop_ins) = crate::plugins::manager::discover_plugins(&scope);
+    let mut items = Vec::new();
+    for p in built_ins.iter().chain(drop_ins.iter()) {
+        let source = if p.is_user { "user" } else { "built-in" };
+        items.push(json!({
+            "id": p.id,
+            "enabled": p.enabled,
+            "status": p.status,
+            "source": source,
+            "extensions": p.extensions
+        }));
+    }
+    let total = items.len();
+    json!({
+        "schemaVersion": "1",
+        "kind": "plugins",
+        "items": items,
+        "filters": {
+            "source": Value::Null,
+            "enabled": Value::Null
+        },
+        "counts": {
+            "total": total,
+            "returned": total,
+            "page": { "offset": 0, "limit": 100 }
+        },
+        "kindRegistry": kind_registry(),
+        "providerRegistry": provider_registry(),
+        "contributionsRegistry": contributions_registry()
+    })
+}
+
+fn build_jobs_response(db_path: &Path) -> Value {
+    let conn = match rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) {
+        Ok(c) => c,
+        Err(_) => {
+            return json!({
+                "schemaVersion": "1",
+                "kind": "jobs",
+                "items": [],
+                "filters": {
+                    "status": Value::Null,
+                    "nodeId": Value::Null
+                },
+                "counts": {
+                    "total": 0,
+                    "returned": 0,
+                    "page": { "offset": 0, "limit": 100 }
+                }
+            });
+        }
+    };
+
+    let mut items = Vec::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT id, extension_id, extension_version, extension_kind, node_id, content_hash, priority, status, failure_reason, runner, created_at, claimed_at, finished_at, submitted_by FROM state_jobs ORDER BY created_at DESC") {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok(json!({
+                "id": r.get::<_, String>(0)?,
+                "extensionId": r.get::<_, String>(1)?,
+                "extensionVersion": r.get::<_, String>(2)?,
+                "extensionKind": r.get::<_, String>(3)?,
+                "nodeId": r.get::<_, String>(4)?,
+                "contentHash": r.get::<_, String>(5)?,
+                "priority": r.get::<_, i64>(6)?,
+                "status": r.get::<_, String>(7)?,
+                "failureReason": r.get::<_, Option<String>>(8)?,
+                "runner": r.get::<_, String>(9)?,
+                "createdAt": r.get::<_, i64>(10)?,
+                "claimedAt": r.get::<_, Option<i64>>(11)?,
+                "finishedAt": r.get::<_, Option<i64>>(12)?,
+                "submittedBy": r.get::<_, Option<String>>(13)?
+            }))
+        }) {
+            for row in rows.flatten() {
+                items.push(row);
+            }
+        }
+    }
+
+    let total = items.len();
+    json!({
+        "schemaVersion": "1",
+        "kind": "jobs",
+        "items": items,
+        "filters": {
+            "status": Value::Null,
+            "nodeId": Value::Null
+        },
+        "counts": {
+            "total": total,
+            "returned": total,
+            "page": { "offset": 0, "limit": 100 }
+        }
+    })
 }
 
 fn build_nodes_response(db_path: &Path) -> Value {
@@ -553,15 +1071,20 @@ fn build_nodes_response(db_path: &Path) -> Value {
     })
 }
 
-fn send_json_response(mut stream: &TcpStream, status_code: u16, status_text: &str, body: &Value) {
+fn send_json_response(mut stream: &TcpStream, status_code: u16, status_text: &str, body: &Value, dev_cors: bool) {
     let body_str = serde_json::to_string(body).unwrap_or_default();
+    let cors_header = if dev_cors {
+        "Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n\
+         Access-Control-Allow-Headers: content-type, authorization, x-skill-map-token\r\n"
+    } else {
+        ""
+    };
     let response = format!(
         "HTTP/1.1 {status_code} {status_text}\r\n\
          Content-Type: application/json; charset=utf-8\r\n\
          Content-Length: {}\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-         Access-Control-Allow-Headers: *\r\n\
+         {cors_header}\
          Connection: close\r\n\
          \r\n\
          {body_str}",
@@ -570,13 +1093,20 @@ fn send_json_response(mut stream: &TcpStream, status_code: u16, status_text: &st
     let _ = stream.write_all(response.as_bytes());
 }
 
-fn send_options_response(mut stream: &TcpStream) {
-    let response = "HTTP/1.1 204 No Content\r\n\
-         Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-         Access-Control-Allow-Headers: *\r\n\
+fn send_options_response(mut stream: &TcpStream, dev_cors: bool) {
+    let cors_header = if dev_cors {
+        "Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n\
+         Access-Control-Allow-Headers: content-type, authorization, x-skill-map-token\r\n"
+    } else {
+        ""
+    };
+    let response = format!(
+        "HTTP/1.1 204 No Content\r\n\
+         {cors_header}\
          Connection: close\r\n\
-         \r\n";
+         \r\n"
+    );
     let _ = stream.write_all(response.as_bytes());
 }
 
