@@ -4,7 +4,9 @@ mod bump;
 mod canon_yaml;
 mod catalog;
 mod cli;
+mod config;
 mod diagnose;
+mod enrich;
 mod extract;
 mod findings;
 mod format;
@@ -17,6 +19,7 @@ mod mask;
 mod model;
 mod norm;
 mod orphans;
+mod plugins;
 mod provider;
 mod record;
 mod resolve;
@@ -51,7 +54,13 @@ fn main() -> ExitCode {
     };
     let prints_elapsed = !matches!(
         cli.command,
-        Some(cli::Command::Version | cli::Command::Watch { .. } | cli::Command::Scan { watch: true, .. }) | None
+        Some(cli::Command::Version | cli::Command::Watch { .. } | cli::Command::Scan { watch: true, .. }
+            | cli::Command::Config(config::ConfigArgs {
+                command: config::ConfigCommand::List { .. }
+                    | config::ConfigCommand::Get { .. }
+                    | config::ConfigCommand::Show { .. }
+            })
+        ) | None
     );
     if prints_elapsed && !cli.global.quiet {
         eprint!("\ndone in {}\n", cli::format_elapsed(started.elapsed().as_millis() as u64));

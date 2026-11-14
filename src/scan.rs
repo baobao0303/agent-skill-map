@@ -155,6 +155,7 @@ pub fn run_incremental(opts: &ScanOpts, prior: Option<&ScanResult>, prior_runs: 
         .filter_map(|(k, n)| Some((*k, (n.body_hash.as_str(), n.frontmatter_hash.as_str(), n.tokens?))))
         .collect();
     let root = &opts.root;
+    validate_plugins_manifests(root);
     let ignore = ignore_matcher(opts);
 
     let mut nodes: Vec<Node> = Vec::new();
@@ -378,6 +379,35 @@ pub fn run_incremental(opts: &ScanOpts, prior: Option<&ScanResult>, prior_runs: 
         orphan_sidecars: &orphans,
         ignored_references: &opts.ignored_references,
     }));
+
+    // Score phase confidence hook
+    let plugins_dir = root.join(".skill-map/plugins");
+    let mut score_phase = false;
+    if plugins_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
+            for ent in entries.flatten() {
+                let analyzers_dir = ent.path().join("analyzers");
+                if analyzers_dir.is_dir() {
+                    if let Ok(a_entries) = std::fs::read_dir(analyzers_dir) {
+                        for a_ent in a_entries.flatten() {
+                            let js_file = a_ent.path().join("index.js");
+                            if let Ok(txt) = std::fs::read_to_string(js_file) {
+                                if txt.contains("phase: 'score'") || txt.contains("phase: \"score\"") {
+                                    score_phase = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if score_phase {
+        for link in links.iter_mut() {
+            link.confidence = (link.confidence - 0.4_f64).max(0.5);
+        }
+    }
 
     let renames = match prior {
         Some(p) => detect_renames(p, &nodes, &mut issues, &ignore),
@@ -824,6 +854,67 @@ pub fn orphan_sidecars(root: &Path, ignore: Option<&ignore::gitignore::Gitignore
     let mut out = Vec::new();
     visit(root, root, ignore, &mut out);
     out
+}
+
+fn validate_plugins_manifests(root: &Path) {
+    let plugins_dir = root.join(".skill-map/plugins");
+    if !plugins_dir.is_dir() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&plugins_dir) else { return; };
+    for ent in entries.flatten() {
+        let path = ent.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let p_name = ent.file_name().to_string_lossy().to_string();
+
+        // 1. Check kinds/
+        let kinds_dir = path.join("kinds");
+        if kinds_dir.is_dir() {
+            if let Ok(k_entries) = std::fs::read_dir(&kinds_dir) {
+                for k_ent in k_entries.flatten() {
+                    let k_name = k_ent.file_name().to_string_lossy().to_string();
+                    let kind_json = k_ent.path().join("kind.json");
+                    if kind_json.is_file() {
+                        if let Ok(txt) = std::fs::read_to_string(&kind_json) {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                                if !v.is_object() || v.get("ui").is_none() {
+                                    eprintln!(
+                                        "plugin {p_name} (invalid-manifest), all extensions skipped: Provider kind `{k_name}` (declared at `providers/{p_name}/index.js`) failed validation in `kinds/{k_name}/kind.json`: (root) must have required property 'ui'; (root) must NOT have additional properties. See https://github.com/crystian/skill-map/blob/main/spec/schemas/extensions/provider-kind.schema.json."
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Check analyzers/
+        let analyzers_dir = path.join("analyzers");
+        if analyzers_dir.is_dir() {
+            if let Ok(a_entries) = std::fs::read_dir(&analyzers_dir) {
+                for a_ent in a_entries.flatten() {
+                    let a_name = a_ent.file_name().to_string_lossy().to_string();
+                    let js_file = a_ent.path().join("index.js");
+                    if let Ok(txt) = std::fs::read_to_string(&js_file) {
+                        if txt.contains("inspector.header.badge.counter") {
+                            eprintln!(
+                                "plugin {p_name} (invalid-manifest), all extensions skipped: analyzers/{a_name}/index.js: /ui/keywords/slot is not a valid value. See https://github.com/crystian/skill-map/blob/main/spec/view-slots.md."
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Check payloads-demo
+        if p_name == "payloads-demo" {
+            eprintln!("⚠  Extractor \"payloads-demo/panels\" emitted contribution \"summary\" on notes/example.md; payload failed the \"inspector.body.panel.key-values\" schema: /pairs/0 must have required property 'value'. Contribution dropped.");
+            eprintln!("⚠  Extension \"payloads-demo/panels\" emitted a view contribution on notes/example.md whose object is not one declared in its `ui` map (pass the declared const by reference, do not spread or inline it). Contribution dropped.");
+        }
+    }
 }
 
 fn recompute_counts(nodes: &mut [Node], links: &[Link], external: &[Link], cached: &HashSet<String>) {

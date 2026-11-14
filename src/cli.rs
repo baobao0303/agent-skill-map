@@ -2,9 +2,12 @@
 //! skill-map's CLI contract (spec_doc §18) so both binaries can run the same
 //! conformance scenarios.
 
+use crate::config;
+use crate::enrich;
 use crate::findings;
 use crate::history;
 use crate::model::{Issue, ScanResult};
+use crate::plugins;
 use crate::record;
 use crate::scope::Scope;
 use crate::{format, jsjson, provider, scan, store};
@@ -147,6 +150,12 @@ pub enum Command {
     Findings(findings::FindingsArgs),
     /// Filter execution records.
     History(history::HistoryArgs),
+    /// Configuration commands.
+    Config(config::ConfigArgs),
+    /// Plugins maintenance verbs.
+    Plugins(plugins::PluginsArgs),
+    /// Refresh enrichment rows.
+    Enrich(enrich::EnrichArgs),
 }
 
 #[derive(Subcommand)]
@@ -445,6 +454,9 @@ pub fn dispatch(cli: &Cli) -> Result<u8, CliError> {
         Command::Record(args) => record::run(cli, &scope, &db_path(cli, &scope), args),
         Command::Findings(args) => findings::run(cli, &scope, &db_path(cli, &scope), args),
         Command::History(args) => history::run(cli, &scope, &db_path(cli, &scope), args),
+        Command::Config(args) => config::run(cli, &scope, args),
+        Command::Plugins(args) => plugins::run(cli, &scope, args),
+        Command::Enrich(args) => enrich::run(cli, &scope, args),
     }
 }
 
