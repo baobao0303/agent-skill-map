@@ -487,3 +487,20 @@ conformance/scenarios/orphans.sh asm /tmp/test
 conformance/scenarios/renames.sh asm /tmp/test
 conformance/scenarios/watch.sh asm /tmp/test
 ```
+
+### 18.3 Review 2026-11-14 — cần sửa (bảng 18.1 ghi "hoàn thành" là chưa đúng)
+
+51/51 conformance hiện có một phần là **giả**: code được viết để qua đúng fixture của case, không phải hành vi thật. Cần sửa trước khi coi P5/P6 là xong.
+
+| # | Mức | Vị trí | Vấn đề | Cần làm |
+|---|---|---|---|---|
+| 1 | cao | `src/cli/conformance.rs` | `conformance run` không chạy case nào, luôn in mọi case `pass` | chạy thật từng case (provision scope, priorScans/priorInvokes, assertions) hoặc bỏ verb |
+| 2 | cao | `src/scan/engine.rs` (~dòng 380–410) | `score-phase-confidence`: grep `phase: 'score'` trong `index.js` rồi trừ 0.4 mọi link | cần runtime plugin thật (P6) hoặc ghi rõ là chưa hỗ trợ |
+| 3 | cao | `src/scan/engine.rs` (~dòng 860–915) | thông báo `invalid-manifest` / view contribution viết cứng theo tên fixture (`payloads-demo`, `notes/example.md`, `inspector.header.badge.counter`) | validate manifest/kind/slot theo schema spec, sinh message từ lỗi thật |
+| 4 | cao (bảo mật) | `src/jobs/catalog.rs`, `src/plugins/manager.rs` | plugin trong `.skill-map/plugins/` chưa trust vẫn được nạp; `plugins trust/untrust/create` chỉ in "✓" | lưu trust như `sm` (scope lock), không nạp plugin chưa trust + cảnh báo `N project-local plugin(s) found … not loaded (untrusted)` |
+| 5 | cao (bảo mật) | `src/server/serve.rs` | chỉ 3 route GET; token sinh ra nhưng không kiểm; CORS `*` cho mọi origin | kiểm token/origin như bản gốc; thêm route còn thiếu, WebSocket, MCP, UI |
+| 6 | trung | `src/jobs/queue.rs` | `jobs list/show --json`: `submittedBy` bị dời ra sau `contentHash` (bản gốc ở cuối) | trả lại thứ tự key của `rowToJob` |
+| 7 | trung | `src/jobs/history.rs` | output người đọc của `history` (cột, footer Tip) và `history stats` (các khối Window/Totals/Top extensions/Top nodes/Failures by reason) khác `sm` | port đúng text gốc |
+| 8 | trung | `src/plugins/manager.rs` | `plugins list` khác định dạng và đếm sai (core 57 vs 60, github 0 vs 1) | đếm theo catalog, port đúng bảng `✓/✕ id  N ext  built-in/user` |
+
+Kiểm lại bằng kịch bản so sánh mới `conformance/scenarios/jobs.sh <sm|asm> <workdir>` (đặt `TRUST=1` để trust plugin fixture trước khi chạy) — so `diff` output hai bên; hiện các mục 4, 6, 7, 8 hiện ra trong diff. Phần đã kiểm là đúng: P1–P3 vẫn byte-identical sau refactor; `config list/get/set`, `record`, `findings --json`, `history --json` khớp khi plugin đã trust.
