@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 pub const DIR: &str = ".skill-map";
 const LOCK_FILE: &str = "scope.lock.json";
 const GRANT_NAMESPACE: &str = "local-config";
-const SCOPE_GITIGNORE: &str = include_str!("schema/scope.gitignore");
+const SCOPE_GITIGNORE: &str = include_str!("../schema/scope.gitignore");
 
 pub struct Scope {
     pub root: PathBuf,

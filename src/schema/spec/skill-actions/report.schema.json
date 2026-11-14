@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skill-map.ai/spec/v1/skill-actions/report.schema.json",
+  "title": "SkillActionReport",
+  "description": "Canonical report contract for every skill action (`skill-actions.md`). Skills carry no `report.schema.json` of their own, so the record path resolves a `skill:`-prefixed job's report against this ONE schema, as a constant, without consulting the catalog (an uninstalled skill must not orphan its running job). Extends `report-base.schema.json` (the kernel-validated `confidence` + `safety` pair) and adds a single required `summary`. Additional properties stay OPEN deliberately: a skill may ask its agent for extra structured fields and they persist with the execution (`state_executions.report_json`) without schema coordination; no namespace envelope applies, so record writes the execution row only (no summaries, findings, or tags write-through).",
+  "allOf": [{ "$ref": "../report-base.schema.json" }],
+  "type": "object",
+  "required": ["summary"],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The agent's one-paragraph account of what the skill did against the target file: what it analyzed or changed, and the outcome. This is the field the executions history surfaces."
+    }
+  }
+}
+

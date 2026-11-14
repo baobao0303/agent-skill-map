@@ -1,30 +1,19 @@
-mod agent;
-mod analyze;
-mod bump;
-mod canon_yaml;
-mod catalog;
-mod cli;
-mod diagnose;
-mod extract;
-mod format;
-mod frontmatter;
-mod issues;
-mod jobs;
-mod jsjson;
-mod mask;
-mod model;
-mod norm;
-mod orphans;
-mod provider;
-mod resolve;
-mod scan;
-mod scope;
-mod sidecar;
-mod sidecars;
-mod store;
-mod tokens;
-mod validate;
-mod walk;
+pub mod cli;
+pub mod jobs;
+pub mod kernel;
+pub mod plugins;
+pub mod scan;
+pub mod server;
+pub mod sidecar;
+
+// Domain submodules re-exported so `crate::<submodule>` continues to work directly across the codebase
+pub use cli::{conformance, format};
+pub use jobs::{agent, catalog, findings, history, record};
+pub use kernel::{canon_yaml, frontmatter, jsjson, mask, model, norm, scope, store, tokens, validate, walk};
+pub use plugins::{config, enrich};
+pub use scan::{analyze, diagnose, extract, provider, resolve};
+pub use server::serve;
+pub use sidecar::{bump, issues, orphans, sidecars};
 
 use clap::Parser;
 use clap::error::{ContextKind, ContextValue, ErrorKind};
@@ -40,7 +29,11 @@ fn main() -> ExitCode {
         Ok(code) => code,
         Err(e) => {
             match &e {
-                cli::CliError::Raw(m, _) => eprintln!("{m}"),
+                cli::CliError::Raw(m, _) => {
+                    if !m.is_empty() {
+                        eprintln!("{m}");
+                    }
+                }
                 _ => eprintln!("✕  {}", e.message()),
             }
             e.exit_code()
@@ -48,7 +41,14 @@ fn main() -> ExitCode {
     };
     let prints_elapsed = !matches!(
         cli.command,
-        Some(cli::Command::Version | cli::Command::Watch { .. } | cli::Command::Scan { watch: true, .. }) | None
+        Some(cli::Command::Version | cli::Command::Watch { .. } | cli::Command::Scan { watch: true, .. }
+            | cli::Command::Serve(_)
+            | cli::Command::Config(config::ConfigArgs {
+                command: config::ConfigCommand::List { .. }
+                    | config::ConfigCommand::Get { .. }
+                    | config::ConfigCommand::Show { .. }
+            })
+        ) | None
     );
     if prints_elapsed && !cli.global.quiet {
         eprint!("\ndone in {}\n", cli::format_elapsed(started.elapsed().as_millis() as u64));

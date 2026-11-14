@@ -11,8 +11,8 @@ use crate::scope::Scope;
 use serde_json::Value;
 use std::sync::LazyLock;
 
-static BUILT_INS: LazyLock<Vec<Value>> =
-    LazyLock::new(|| serde_json::from_str(include_str!("schema/catalog.json")).expect("bundled catalog"));
+pub static BUILT_INS: LazyLock<Vec<Value>> =
+    LazyLock::new(|| serde_json::from_str(include_str!("../schema/catalog.json")).expect("bundled catalog"));
 
 #[derive(Clone)]
 pub struct Ext {

@@ -11,7 +11,7 @@ use std::sync::LazyLock;
 
 macro_rules! schemas {
     ($($file:literal),* $(,)?) => {
-        [$(include_str!(concat!("schema/json/", $file))),*]
+        [$(include_str!(concat!("../schema/json/", $file))),*]
     };
 }
 
@@ -33,6 +33,8 @@ static REGISTRY: LazyLock<HashMap<String, Value>> = LazyLock::new(|| {
         "../spec/report-base.schema.json",
         "../spec/summaries/markdown.schema.json",
         "../spec/findings/report.schema.json",
+        "../spec/tags/markdown.schema.json",
+        "../spec/skill-actions/report.schema.json",
     ]
     .iter()
     .map(|text| {

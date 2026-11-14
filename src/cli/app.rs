@@ -2,8 +2,16 @@
 //! skill-map's CLI contract (spec_doc §18) so both binaries can run the same
 //! conformance scenarios.
 
+use crate::config;
+use crate::conformance;
+use crate::enrich;
+use crate::findings;
+use crate::history;
 use crate::model::{Issue, ScanResult};
+use crate::plugins;
+use crate::record;
 use crate::scope::Scope;
+use crate::serve;
 use crate::{format, jsjson, provider, scan, store};
 use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
@@ -138,6 +146,22 @@ pub enum Command {
         #[arg(long, default_value = "ascii")]
         format: String,
     },
+    /// Close a running job with success or failure. Nonce is the sole credential.
+    Record(record::RecordArgs),
+    /// Print stored probabilistic findings (finder judgments + kernel safety rows).
+    Findings(findings::FindingsArgs),
+    /// Filter execution records.
+    History(history::HistoryArgs),
+    /// Configuration commands.
+    Config(config::ConfigArgs),
+    /// Plugins maintenance verbs.
+    Plugins(plugins::PluginsArgs),
+    /// Refresh enrichment rows.
+    Enrich(enrich::EnrichArgs),
+    /// Run the spec conformance suite.
+    Conformance(conformance::ConformanceArgs),
+    /// Start local HTTP server & REST BFF.
+    Serve(serve::ServeArgs),
 }
 
 #[derive(Subcommand)]
@@ -433,6 +457,14 @@ pub fn dispatch(cli: &Cli) -> Result<u8, CliError> {
         ),
         Command::List { kind } => list(cli, &scope, kind.as_deref()),
         Command::Graph { format } => graph(cli, &scope, format),
+        Command::Record(args) => record::run(cli, &scope, &db_path(cli, &scope), args),
+        Command::Findings(args) => findings::run(cli, &scope, &db_path(cli, &scope), args),
+        Command::History(args) => history::run(cli, &scope, &db_path(cli, &scope), args),
+        Command::Config(args) => config::run(cli, &scope, args),
+        Command::Plugins(args) => plugins::run(cli, &scope, args),
+        Command::Enrich(args) => enrich::run(cli, &scope, args),
+        Command::Conformance(args) => conformance::run(cli, &scope, args),
+        Command::Serve(args) => serve::run(cli, &scope, args),
     }
 }
 
