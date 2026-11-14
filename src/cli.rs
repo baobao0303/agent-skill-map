@@ -11,6 +11,7 @@ use crate::model::{Issue, ScanResult};
 use crate::plugins;
 use crate::record;
 use crate::scope::Scope;
+use crate::serve;
 use crate::{format, jsjson, provider, scan, store};
 use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
@@ -159,6 +160,8 @@ pub enum Command {
     Enrich(enrich::EnrichArgs),
     /// Run the spec conformance suite.
     Conformance(conformance::ConformanceArgs),
+    /// Start local HTTP server & REST BFF.
+    Serve(serve::ServeArgs),
 }
 
 #[derive(Subcommand)]
@@ -461,6 +464,7 @@ pub fn dispatch(cli: &Cli) -> Result<u8, CliError> {
         Command::Plugins(args) => plugins::run(cli, &scope, args),
         Command::Enrich(args) => enrich::run(cli, &scope, args),
         Command::Conformance(args) => conformance::run(cli, &scope, args),
+        Command::Serve(args) => serve::run(cli, &scope, args),
     }
 }
 

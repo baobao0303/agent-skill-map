@@ -26,6 +26,7 @@ mod record;
 mod resolve;
 mod scan;
 mod scope;
+mod serve;
 mod sidecar;
 mod sidecars;
 mod store;
@@ -60,6 +61,7 @@ fn main() -> ExitCode {
     let prints_elapsed = !matches!(
         cli.command,
         Some(cli::Command::Version | cli::Command::Watch { .. } | cli::Command::Scan { watch: true, .. }
+            | cli::Command::Serve(_)
             | cli::Command::Config(config::ConfigArgs {
                 command: config::ConfigCommand::List { .. }
                     | config::ConfigCommand::Get { .. }
