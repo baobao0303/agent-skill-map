@@ -1,0 +1,310 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skill-map.ai/spec/v1/input-types.schema.json",
+  "title": "InputTypes",
+  "description": "Closed catalog of input-types for plugin settings. The plugin author declares each user-configurable setting in the manifest's `settings` map by picking an `input-type` from this catalog; the kernel knows the schema for each type, the UI ships a generated form per type, and the CLI's `sm plugins config <id>` command exposes the same surface. Plugin authors NEVER write JSON Schema for settings, they pick a type by name and supply per-type parameters (label, default, min/max, options for enums, etc.). Closed catalog by design: every new input-type requires spec + UI form + CLI prompter + tests. Versioned via the manifest field `catalogCompat` (semver against the catalog as a whole). For the rationale and open issues, see ROADMAP.md §UI contribution system.",
+  "type": "object",
+  "$defs": {
+    "InputTypeName": {
+      "type": "string",
+      "oneOf": [
+        { "const": "string-list", "description": "Array of free-form strings." },
+        { "const": "single-string", "description": "Single text input." },
+        { "const": "boolean-flag", "description": "On/off toggle." },
+        { "const": "integer", "description": "Integer with optional bounds." },
+        { "const": "number", "description": "Decimal number with optional bounds." },
+        { "const": "enum-pick", "description": "Pick one from a closed set." },
+        { "const": "enum-multipick", "description": "Pick zero or more from a closed set." },
+        { "const": "path-glob", "description": "Glob pattern (single or multiple)." },
+        { "const": "regex", "description": "ECMAScript regex pattern body." },
+        { "const": "secret", "description": "Sensitive string, forced into project-local storage (gitignored), not encrypted." },
+        { "const": "key-value-list", "description": "Editable mapping of strings to strings." },
+        { "const": "match-list", "description": "List of match entries, each literal (exact equality), regex (unanchored test), or glob (gitignore-style)." }
+      ],
+      "description": "Closed enum of input-type identifiers. Adding an entry requires the full spec/UI/CLI/tests round-trip. Removing or renaming an entry is a catalog-major-bump and triggers `sm plugins upgrade` migration. Each member's `description` is the catalog summary surfaced by `sm plugins slots list` and is the single source of truth for the generated kernel + CLI mirrors (see `scripts/generate-view-catalog.js`)."
+    },
+    "ISettingDeclaration": {
+      "description": "Manifest-side declaration of a single setting, keyed in `IPluginManifest.settings[<settingId>]`. Discriminated by `type`; per-type parameters live in the `oneOf` branches below. The plugin author NEVER writes JSON Schema, `type` is a name from `InputTypeName`, the kernel validates the user-supplied value against the per-type value schema.",
+      "oneOf": [
+        { "$ref": "#/$defs/Setting_StringList" },
+        { "$ref": "#/$defs/Setting_SingleString" },
+        { "$ref": "#/$defs/Setting_BooleanFlag" },
+        { "$ref": "#/$defs/Setting_Integer" },
+        { "$ref": "#/$defs/Setting_Number" },
+        { "$ref": "#/$defs/Setting_EnumPick" },
+        { "$ref": "#/$defs/Setting_EnumMultipick" },
+        { "$ref": "#/$defs/Setting_PathGlob" },
+        { "$ref": "#/$defs/Setting_Regex" },
+        { "$ref": "#/$defs/Setting_Secret" },
+        { "$ref": "#/$defs/Setting_KeyValueList" },
+        { "$ref": "#/$defs/Setting_MatchList" }
+      ]
+    },
+    "_Common": {
+      "type": "object",
+      "required": ["type", "label"],
+      "properties": {
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "Short human-readable label shown above the form control. English-only per AGENTS.md."
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 256,
+          "description": "Optional helper text shown below the control. English-only."
+        }
+      }
+    },
+    "Setting_StringList": {
+      "allOf": [{ "$ref": "#/$defs/_Common" }],
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "label"],
+      "properties": {
+        "type": { "const": "string-list" },
+        "label": true,
+        "description": true,
+        "default": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "min": { "type": "integer", "minimum": 0, "description": "Minimum item count required to validate." },
+        "max": { "type": "integer", "minimum": 1, "description": "Maximum item count permitted." },
+        "itemMaxLength": { "type": "integer", "minimum": 1, "default": 256 }
+      },
+      "description": "Array of free-form strings. Renders as a tag input. Use for keyword lists, ignore patterns, allow-lists. Value type at runtime: `string[]`."
+    },
+    "Setting_SingleString": {
+      "allOf": [{ "$ref": "#/$defs/_Common" }],
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "label"],
+      "properties": {
+        "type": { "const": "single-string" },
+        "label": true,
+        "description": true,
+        "default": { "type": "string" },
+        "minLength": { "type": "integer", "minimum": 0 },
+        "maxLength": { "type": "integer", "minimum": 1 },
+        "pattern": {
+          "type": "string",
+          "description": "Optional ECMAScript regex (no flags) the value must match. Validated at form submit AND at extractor invocation."
+        }
+      },
+      "description": "Single text input. Use for short identifiers, URLs, names. Value type at runtime: `string`."
+    },
+    "Setting_BooleanFlag": {
+      "allOf": [{ "$ref": "#/$defs/_Common" }],
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "label"],
+      "properties": {
+        "type": { "const": "boolean-flag" },
+        "label": true,
+        "description": true,
+        "default": { "type": "boolean", "default": false }
+      },
+      "description": "On/off toggle. Renders as PrimeNG `<p-toggleswitch>`. Value type at runtime: `boolean`."
+    },
+    "Setting_Integer": {
+      "allOf": [{ "$ref": "#/$defs/_Common" }],
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "label"],
+      "properties": {
+        "type": { "const": "integer" },
+        "label": true,
+        "description": true,
+        "default": { "type": "integer" },
+        "min": { "type": "integer" },
+        "max": { "type": "integer" },
+        "step": { "type": "integer", "minimum": 1, "default": 1 }
+      },
+      "description": "Integer input with optional bounds. Renders as PrimeNG `<p-inputnumber>` with spinner. Value type at runtime: `number` (always integer)."
+    },
+    "Setting_Number": {
+      "allOf": [{ "$ref": "#/$defs/_Common" }],
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "label"],
+      "properties": {
+        "type": { "const": "number" },
+        "label": true,
+        "description": true,
+        "default": { "type": "number" },
+        "min": { "type": "number" },
+        "max": { "type": "number" },
+        "step": { "type": "number", "exclusiveMinimum": 0, "default": 1 }
+      },
+      "description": "Decimal number input with optional bounds (a threshold like 0.3, a ratio, a confidence floor). Renders as PrimeNG `<p-inputnumber>` with `mode=\"decimal\"`. Value type at runtime: `number` (whole OR fractional accepted; pick `integer` instead when the value must be a whole number). Validation rejects `NaN` / `Infinity`."
+    },
+    "Setting_EnumPick": {
+      "allOf": [{ "$ref": "#/$defs/_Common" }],
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "label", "options"],
+      "properties": {
+        "type": { "const": "enum-pick" },
+        "label": true,
+        "description": true,
+        "options": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["value", "label"],
+            "properties": {
+              "value": { "type": "string", "minLength": 1, "maxLength": 64 },
+              "label": { "type": "string", "minLength": 1, "maxLength": 64 }
+            }
+          }
+        },
+        "default": { "type": "string" }
+      },
+      "description": "Pick one from a closed set. Renders as PrimeNG `<p-select>` (≤ 7 options) or `<p-radiobutton>` group (≤ 4 options). Value type at runtime: `string` (the picked option's `value`)."
+    },
+    "Setting_EnumMultipick": {
+      "allOf": [{ "$ref": "#/$defs/_Common" }],
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "label", "options"],
+      "properties": {
+        "type": { "const": "enum-multipick" },
+        "label": true,
+        "description": true,
+        "options": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["value", "label"],
+            "properties": {
+              "value": { "type": "string", "minLength": 1, "maxLength": 64 },
+              "label": { "type": "string", "minLength": 1, "maxLength": 64 }
+            }
+          }
+        },
+        "default": { "type": "array", "items": { "type": "string" } },
+        "min": { "type": "integer", "minimum": 0 },
+        "max": { "type": "integer", "minimum": 1 }
+      },
+      "description": "Pick zero or more from a closed set. Renders as PrimeNG `<p-multiselect>` or checkbox group. Value type at runtime: `string[]`."
+    },
+    "Setting_PathGlob": {
+      "allOf": [{ "$ref": "#/$defs/_Common" }],
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "label"],
+      "properties": {
+        "type": { "const": "path-glob" },
+        "label": true,
+        "description": true,
+        "default": { "type": "string" },
+        "multiple": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, accepts `string[]` of glob patterns; when false (default), single `string`."
+        }
+      },
+      "description": "Glob pattern (POSIX-style, `**` / `*` / `?`). Validated against the project's installed glob library at form submit. Value type at runtime: `string` (when `multiple: false`) or `string[]`."
+    },
+    "Setting_Regex": {
+      "allOf": [{ "$ref": "#/$defs/_Common" }],
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "label"],
+      "properties": {
+        "type": { "const": "regex" },
+        "label": true,
+        "description": true,
+        "default": { "type": "string" },
+        "flags": {
+          "type": "string",
+          "pattern": "^[gimsuy]*$",
+          "default": "",
+          "description": "ECMAScript regex flags allowed. Subset: `g`, `i`, `m`, `s`, `u`, `y`. Author chooses which flags the user-supplied pattern compiles with, the user supplies only the body."
+        }
+      },
+      "description": "ECMAScript regex pattern (the body, no `/` delimiters). Validated by attempting `new RegExp(value, flags)` at form submit and again at extension invocation. Compilation failure → form error at write time; at runtime the resolver falls back to the declared `default` and warns, it never aborts the scan. Value type at runtime: `string`."
+    },
+    "Setting_Secret": {
+      "allOf": [{ "$ref": "#/$defs/_Common" }],
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "label"],
+      "properties": {
+        "type": { "const": "secret" },
+        "label": true,
+        "description": true,
+        "envVar": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]*$",
+          "description": "Optional env var name the kernel checks first; if set in the process environment, that value wins over any stored value, letting CI inject the secret without writing it to disk at all."
+        }
+      },
+      "description": "Sensitive string (token, password, API key). Renders as `<input type=\"password\">` with reveal toggle. **Stored in project-local `settings.local.json` (gitignored), never in the committed `settings.json`**: the protection is that the value never travels via the shared repo, NOT encryption, it is kept as plain text on the local machine. The kernel routes any `secret`-typed setting to the project-local layer automatically, the dynamic equivalent of `PROJECT_LOCAL_ONLY_KEYS` (the destination follows the declared type, not a fixed key list), so `sm plugins config` writes a secret to `settings.local.json` even without an explicit local flag. Logged as `<redacted>` in CLI output. Value type at runtime: `string`."
+    },
+    "Setting_KeyValueList": {
+      "allOf": [{ "$ref": "#/$defs/_Common" }],
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "label"],
+      "properties": {
+        "type": { "const": "key-value-list" },
+        "label": true,
+        "description": true,
+        "keyLabel": { "type": "string", "minLength": 1, "maxLength": 32, "default": "Key" },
+        "valueLabel": { "type": "string", "minLength": 1, "maxLength": 32, "default": "Value" },
+        "default": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["key", "value"],
+            "properties": {
+              "key": { "type": "string" },
+              "value": { "type": "string" }
+            }
+          }
+        },
+        "min": { "type": "integer", "minimum": 0 },
+        "max": { "type": "integer", "minimum": 1 }
+      },
+      "description": "Editable mapping of strings to strings. Renders as a small editable table. Use for custom translations, alias maps, header overrides. Value type at runtime: `Array<{ key: string, value: string }>`."
+    },
+    "Setting_MatchList": {
+      "allOf": [{ "$ref": "#/$defs/_Common" }],
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "label"],
+      "properties": {
+        "type": { "const": "match-list" },
+        "label": true,
+        "description": true,
+        "default": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type", "value"],
+            "properties": {
+              "type": { "enum": ["literal", "regex", "glob"] },
+              "value": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256,
+                "pattern": "^[^\\n\\r\\u0000-\\u001F\\u007F]+$",
+                "description": "The match expression. Single line, no ASCII control or DEL characters (bans ANSI escape injection at the source)."
+              }
+            }
+          }
+        }
+      },
+      "description": "List of match entries tested against a candidate string, each entry one of three kinds: `literal` (exact equality with the candidate, case-sensitive), `regex` (ECMAScript pattern body, no `/` delimiters, no flags; unanchored `RegExp.test`, so the author anchors with `^` / `$` when exactness is wanted; compiled at form submit and again at extension invocation, like `regex`), or `glob` (gitignore-style pattern matched by the implementation's ignore engine, the same semantics as `.skillmapignore`: `docs/x/` matches the whole subtree, `*.draft.md` matches at any depth; no compile concept, like `path-glob`). Renders as a list editor: per-entry kind selector plus value input to add, removable rows to prune. An invalid stored value (wrong shape, oversize, uncompilable regex entry) makes the resolver fall back to the declared `default` with a warning, it never aborts the scan. Value type at runtime: `Array<{ type: 'literal' | 'regex' | 'glob', value: string }>`."
+    }
+  }
+}

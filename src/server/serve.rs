@@ -164,19 +164,39 @@ fn handle_connection(
     }
 
     let stream = reader.into_inner();
+    let path = uri.split('?').next().unwrap_or(uri);
+
+    // First-stage loopback gate (DNS rebinding + cross-origin defence):
+    // the Host header must name a loopback host, and so must the Origin on
+    // the API, /ws and /mcp surfaces.
+    let gate = if !host_allowed(headers.get("host").map(String::as_str)) {
+        Some(("host-not-allowed", "Request rejected: Host header is not loopback."))
+    } else if origin_guarded(path) && !origin_allowed(headers.get("origin").map(String::as_str)) {
+        Some(("origin-not-allowed", "Request rejected: Origin header is not loopback."))
+    } else {
+        None
+    };
+    if let Some((code, message)) = gate {
+        send_json_response(
+            stream,
+            403,
+            "Forbidden",
+            &json!({ "ok": false, "error": { "code": code, "message": message, "details": null } }),
+            dev_cors,
+        );
+        return;
+    }
 
     if method == "OPTIONS" {
         send_options_response(stream, dev_cors);
         return;
     }
 
-    let path = uri.split('?').next().unwrap_or(uri);
-
     // Enforce token for mutating API operations
     if (method == "POST" || method == "PUT" || method == "DELETE") && path.starts_with("/api/") {
         let presented = headers.get("x-skill-map-token");
         let token_ok = match presented {
-            Some(t) => t == server_token,
+            Some(t) => constant_time_eq(t.as_bytes(), server_token.as_bytes()),
             None => false,
         };
         if !token_ok {
@@ -1071,12 +1091,66 @@ fn build_nodes_response(db_path: &Path) -> Value {
     })
 }
 
+const LOOPBACK_HOSTNAMES: &[&str] = &["127.0.0.1", "::1", "localhost"];
+
+fn hostname_of(host: &str) -> String {
+    let lower = host.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix('[') {
+        return match rest.find(']') {
+            Some(close) => rest[..close].to_string(),
+            None => lower,
+        };
+    }
+    match lower.find(':') {
+        Some(colon) => lower[..colon].to_string(),
+        None => lower,
+    }
+}
+
+fn host_allowed(host: Option<&str>) -> bool {
+    match host {
+        None | Some("") => true,
+        Some(h) => LOOPBACK_HOSTNAMES.contains(&hostname_of(h).as_str()),
+    }
+}
+
+fn origin_allowed(origin: Option<&str>) -> bool {
+    let Some(origin) = origin.filter(|o| !o.is_empty()) else { return true };
+    if origin.eq_ignore_ascii_case("null") {
+        return true;
+    }
+    let lower = origin.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("http://").or_else(|| lower.strip_prefix("https://")) else { return false };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    LOOPBACK_HOSTNAMES.contains(&hostname_of(host_port).as_str())
+}
+
+fn origin_guarded(path: &str) -> bool {
+    path == "/ws" || path == "/mcp" || path.starts_with("/api/")
+}
+
+/// Compare without an early exit, so response timing leaks nothing about
+/// how much of a presented token matched.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// `createSecurityHeaders`, applied to every response.
+const SECURITY_HEADERS: &str = "Content-Security-Policy: frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'\r\n\
+X-Frame-Options: DENY\r\n\
+X-Content-Type-Options: nosniff\r\n\
+Referrer-Policy: no-referrer\r\n";
+
 fn send_json_response(mut stream: &TcpStream, status_code: u16, status_text: &str, body: &Value, dev_cors: bool) {
     let body_str = serde_json::to_string(body).unwrap_or_default();
     let cors_header = if dev_cors {
         "Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n\
-         Access-Control-Allow-Headers: content-type, authorization, x-skill-map-token\r\n"
+         Access-Control-Allow-Methods: GET,POST,PUT,DELETE,OPTIONS\r\n\
+         Access-Control-Allow-Headers: content-type, authorization\r\n"
     } else {
         ""
     };
@@ -1084,6 +1158,7 @@ fn send_json_response(mut stream: &TcpStream, status_code: u16, status_text: &st
         "HTTP/1.1 {status_code} {status_text}\r\n\
          Content-Type: application/json; charset=utf-8\r\n\
          Content-Length: {}\r\n\
+         {SECURITY_HEADERS}\
          {cors_header}\
          Connection: close\r\n\
          \r\n\
@@ -1096,13 +1171,14 @@ fn send_json_response(mut stream: &TcpStream, status_code: u16, status_text: &st
 fn send_options_response(mut stream: &TcpStream, dev_cors: bool) {
     let cors_header = if dev_cors {
         "Access-Control-Allow-Origin: *\r\n\
-         Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n\
-         Access-Control-Allow-Headers: content-type, authorization, x-skill-map-token\r\n"
+         Access-Control-Allow-Methods: GET,POST,PUT,DELETE,OPTIONS\r\n\
+         Access-Control-Allow-Headers: content-type, authorization\r\n"
     } else {
         ""
     };
     let response = format!(
         "HTTP/1.1 204 No Content\r\n\
+         {SECURITY_HEADERS}\
          {cors_header}\
          Connection: close\r\n\
          \r\n"

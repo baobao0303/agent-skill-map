@@ -1,0 +1,474 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skill-map.ai/spec/v1/view-slots.schema.json",
+  "title": "ViewSlots",
+  "description": "Closed catalog of view slots. A view slot is a kernel-published handle that names a visual surface in the UI, fixes the renderer that draws there, and fixes the payload shape the plugin emits. The plugin author picks ONE slot per view contribution; the kernel validates `ctx.emitContribution(id, payload)` against that slot's payload schema in `$defs.payloads`. There is no separate notion of a 'contract', the slot IS the contract. Closed catalog by design: every new slot requires a spec change + UI renderer mount + scaffolder support + conformance fixtures + tests. Compounds catalog evolution cost; see ROADMAP.md §UI contribution system → 'Known limitations carried forward'. Slots are versioned via the manifest field `catalogCompat` (semver against the catalog as a whole), not per-slot.",
+  "type": "object",
+  "$defs": {
+    "SlotName": {
+      "type": "string",
+      "oneOf": [
+        { "const": "card.title.right", "description": "Small icon marker next to the card title (language flag, platform glyph)." },
+        { "const": "card.subtitle.left", "description": "Single non-negative integer in the card subtitle row." },
+        { "const": "card.footer.left", "description": "Counter chip in the left footer of the card." },
+        { "const": "card.footer.right", "description": "Counter chip in the right footer of the card." },
+        { "const": "graph.node.alert", "description": "Reserved corner badge on the graph node, special-case signals only. No core analyzer emits here; routine \"this node has a problem\" findings belong in `card.footer.right`." },
+        { "const": "inspector.header.badge", "description": "Unified badge in the inspector header cluster: icon and/or label and/or count, optional severity. Multi-cardinality, priority order, modeled on card.footer.left. Replaces the retired inspector.header.badge.counter and inspector.header.badge.tag sub-slots." },
+        { "const": "inspector.action.button", "description": "Action button in the inspector's generic Actions section. Click dispatches a kernel Action by qualified id via POST /api/actions/:id. Always emitted; the payload `enabled` flag carries the dynamic condition (e.g. isStale for the bump button)." },
+        { "const": "inspector.surface.version", "description": "The node's VERSION surface (header version chip + the card's vN label). The claiming Action owns the affordance; click dispatches the payload's actionId (the bump flow). Single-cardinality logical surface." },
+        { "const": "inspector.surface.stability", "description": "The node's STABILITY surface (header stability chip + card badge). The claiming Action owns the affordance; click opens the payload prompt and dispatches its actionId. Single-cardinality logical surface." },
+        { "const": "inspector.surface.tags", "description": "The node's TAG-ROW surface (inline tag editor + the card's tag chips). The claiming Action owns the affordance; edits dispatch the payload's actionId. Single-cardinality logical surface." },
+        { "const": "inspector.surface.summary", "description": "The header's semantic-analysis (summarize) affordance. The claiming probabilistic Action owns it; click submits a job for the payload's actionId. Single-cardinality logical surface." },
+        { "const": "inspector.surface.auto-tag", "description": "The tag row's auto-tag (sparkles) affordance. The claiming probabilistic Action owns it; click submits a job for the payload's actionId. Single-cardinality logical surface." },
+        { "const": "inspector.body.panel.breakdown", "description": "Top-N labeled values rendered as a bar chart in the inspector body." },
+        { "const": "inspector.body.panel.records", "description": "Tabular data (rows × columns ≤ 50 × 6) in the inspector body." },
+        { "const": "inspector.body.panel.tree", "description": "Recursive label/children hierarchy (depth ≤ 6, total ≤ 200) in the inspector body." },
+        { "const": "inspector.body.panel.key-values", "description": "Flat key/value pairs (≤ 50) in the inspector body." },
+        { "const": "inspector.body.panel.link-list", "description": "Clickable scope-relative paths (≤ 100) in the inspector body." },
+        { "const": "inspector.body.panel.markdown", "description": "Sanitized markdown text (≤ 4096 chars) in the inspector body." },
+        { "const": "topbar.nav.start", "description": "Scope-wide indicator chip at the start of the topbar nav (before the view-switcher links)." }
+      ],
+      "description": "Closed catalog of slot identifiers. Adding an entry requires the full spec/UI/scaffolder/conformance round-trip per ROADMAP.md §UI contribution system. Removing or renaming an entry is a catalog-major-bump and triggers `sm plugins upgrade` migration. Slots that share a payload shape (e.g. `card.subtitle.left`, `card.footer.right`, and `card.footer.left` all carry a counter) reference the same payload schema in `$defs.payloads`. Each member's `description` is the catalog summary surfaced by `sm plugins slots list` and is the single source of truth for the generated kernel + CLI mirrors (see `scripts/generate-view-catalog.js`)."
+    },
+    "Severity": {
+      "type": "string",
+      "enum": ["info", "warn", "success", "danger"],
+      "description": "Closed severity palette aligned with PrimeNG `<p-tag>` / `<p-message>` severities. Used by counter, tag, alert, and icon slots for color/contrast hints. The UI maps each severity to a theme-aware tint; plugins do not pick raw colors."
+    },
+    "IconString": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^(?:pi pi-[a-z0-9-]+|pi-[a-z0-9-]+|fa-(?:solid|regular|brands) fa-[a-z0-9-]+|fa-[a-z0-9-]+|[^a-zA-Z].*)$",
+      "description": "Single string, prefix-discriminated by the UI. Four valid shapes: (1) emoji, any value starting with a non-ASCII-letter codepoint renders as text; (2) PrimeIcons, `pi-foo` or `pi pi-foo` renders as `<i class=\"pi pi-foo\">`; (3) FontAwesome explicit family, `fa-solid fa-foo` / `fa-regular fa-foo` / `fa-brands fa-foo` passes through as-is; (4) FontAwesome shorthand, `fa-foo` (no family token) defaults to `fa-solid fa-foo`. Bare class names without a `pi-` / `fa-` prefix are rejected at manifest load (invalid-manifest). Unknown PrimeIcons / FontAwesome names render no icon (silent fallback) plus a console warning."
+    },
+    "IViewContribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slot"],
+      "properties": {
+        "slot": { "$ref": "#/$defs/SlotName" },
+        "label": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "Short human-readable label. Used as metadata (docs / plugin-doctor / aria-label) and, for some slots, rendered in the chip / panel header / table label. English-only per AGENTS.md (`Externalized texts, not internationalized`). Per-slot notes specify whether it is rendered inline; counter slots keep it as metadata only."
+        },
+        "tooltip": {
+          "type": "string",
+          "maxLength": 256,
+          "description": "Hover tooltip shown on the chip or panel header. English-only."
+        },
+        "icon": { "$ref": "#/$defs/IconString" },
+        "emptyText": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Text shown in the empty placeholder when the slot permits an empty payload. Defaults to a UI-supplied generic 'No data.' string. English-only."
+        },
+        "emitWhenEmpty": {
+          "type": "boolean",
+          "default": false,
+          "description": "When false (default), the kernel drops emissions whose payload is structurally empty (zero counter value, empty array, empty tree, etc.) so the slot stays silent. When true, the renderer surfaces an empty placeholder instead. Per-slot definition of 'empty' lives in the payload schema notes."
+        },
+        "priority": {
+          "type": "number",
+          "default": 100,
+          "description": "Optional ordering hint. Slots configured with `order: 'priority'` sort contributions ASC by this value, with alphabetical tie-break by qualified id. Default 100, plugins use it to suggest where their contribution belongs relative to others sharing the same slot. The slot has the final say on whether `priority` is honoured at all."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "slot": {
+                "enum": [
+                  "card.subtitle.left",
+                  "card.footer.left",
+                  "card.footer.right"
+                ]
+              }
+            }
+          },
+          "then": { "required": ["slot", "icon"] }
+        },
+        {
+          "if": { "properties": { "slot": { "const": "card.title.right" } } },
+          "then": { "required": ["slot", "icon"] }
+        }
+      ],
+      "description": "Manifest-side declaration of a single view contribution, keyed in `IExtensionBase.viewContributions[<contributionId>]`. The plugin author picks ONE slot from the closed `SlotName` enum; the slot fixes the renderer and the payload shape. Slots whose renderer is the counter chip require `icon` in the manifest; same for `card.title.right` (the standalone icon slot)."
+    },
+    "payloads": {
+      "description": "Per-slot payload schemas. The kernel validates `ctx.emitContribution(id, payload)` calls against the entry corresponding to the declared slot before persisting to `scan_contributions`. Off-shape payloads emit an `extension.error` event and drop silently (mirror of `emitLink` off-contract drop pattern). Slots that share a renderer share a payload shape; the schema is defined inline at each slot to keep lookups direct (no internal indirection).",
+      "card.title.right": {
+        "title": "IconMarkerPayload",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "icon": {
+            "$ref": "#/$defs/IconString",
+            "description": "Optional payload-time icon override. When omitted the manifest-declared `icon` (which is required for this slot, see `IViewContribution.allOf`) is rendered instead. Lets a plugin emit a different icon per node without redeclaring the manifest."
+          },
+          "severity": { "$ref": "#/$defs/Severity" },
+          "tooltip": { "type": "string", "maxLength": 256 }
+        },
+        "description": "Single icon per node, small standalone marker rendered next to the card title. The manifest requires `icon`; the payload optionally overrides it per node and may add `severity` (color tint) and `tooltip`. No counts, no labels, for chip + number use a counter slot; for label + severity use a tag slot. 'Empty' for `emitWhenEmpty` is the absence of both payload `icon` and a manifest fallback (in practice never empty since the manifest icon is required)."
+      },
+      "card.subtitle.left": { "$ref": "#/$defs/payloads/_counter" },
+      "card.footer.left": { "$ref": "#/$defs/payloads/_counter" },
+      "card.footer.right": { "$ref": "#/$defs/payloads/_counter" },
+      "_counter": {
+        "title": "CounterPayload",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["value"],
+        "properties": {
+          "value": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Single non-negative integer for the chip / badge. 'Empty' for `emitWhenEmpty` purposes is `value === 0`."
+          },
+          "tooltip": { "type": "string", "maxLength": 256 },
+          "severity": {
+            "$ref": "#/$defs/Severity",
+            "description": "Optional severity for visual tinting. The slot decides whether to honour it (`SLOT_REGISTRY[slot].respectSeverity`). The plugin emits the data; the UI decides the presentation."
+          }
+        },
+        "description": "Single icon + integer pair, modelled after the `.sm-gnode__stat` rows in the card footer. Manifest requires `icon` (enforced by `IViewContribution.allOf` for every counter slot); payload carries `value`, optionally `severity` and `tooltip`. The manifest `label` is metadata (docs / plugin-doctor / aria-label) and is NOT rendered inline."
+      },
+      "inspector.header.badge": {
+        "title": "BadgePayload",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "icon": { "$ref": "#/$defs/IconString" },
+          "label": { "type": "string", "minLength": 1, "maxLength": 32 },
+          "count": { "type": "integer", "minimum": 0 },
+          "severity": { "$ref": "#/$defs/Severity" },
+          "tooltip": { "type": "string", "maxLength": 256 }
+        },
+        "anyOf": [
+          { "required": ["icon"] },
+          { "required": ["label"] },
+          { "required": ["count"] }
+        ],
+        "description": "Unified inspector header badge. At least one of `icon`, `label`, `count` is required; optional `severity` tint and `tooltip`. Multi-cardinality slot (priority order, modeled on card.footer.left); a plugin extension may emit several. 'Empty' for `emitWhenEmpty` is the absence of `icon` AND `label` AND `count`. Replaces the retired `_counter`/`_tag` header sub-slots: a counter-style badge sets `count` (+`icon`), a tag-style badge sets `label` (+`severity`), the stale clock sets `icon` + `tooltip`."
+      },
+      "inspector.action.button": {
+        "title": "ActionButtonPayload",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["actionId", "label", "enabled"],
+        "properties": {
+          "actionId": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*/[a-z][a-z0-9-]*$",
+            "description": "Qualified Action id `<plugin>/<action>` the click dispatches via POST /api/actions/:id. Resolved by the kernel registry; an unknown id makes the BFF answer 404."
+          },
+          "label": { "type": "string", "minLength": 1, "maxLength": 48 },
+          "icon": { "$ref": "#/$defs/IconString" },
+          "severity": { "$ref": "#/$defs/Severity" },
+          "enabled": {
+            "type": "boolean",
+            "description": "Dynamic gate. The button is ALWAYS emitted (the persistence upsert refreshes the row each scan); `false` renders it disabled. e.g. `isStale` for the bump button."
+          },
+          "disabledReason": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Tooltip shown when `enabled` is false."
+          },
+          "input": {
+            "type": "object",
+            "description": "Reserved (Step 2+). Static input merged into the dispatch body for parametrized actions that need no user prompt."
+          },
+          "prompt": {
+            "$ref": "#/$defs/payloads/_ActionPrompt",
+            "description": "Reserved (Step 3+). Declares an input-type prompt the UI collects before dispatching (enum-pick for stability, single-string for tags)."
+          },
+          "confirm": {
+            "type": "boolean",
+            "default": false,
+            "description": "Reserved. Require an extra confirm step before dispatch (destructive actions)."
+          }
+        },
+        "description": "An action button rendered in the inspector's generic Actions section. The manifest declares only `{ slot: 'inspector.action.button' }`; the per-node payload carries the action id, label, and the dynamic `enabled` flag. Click dispatches the Action via POST /api/actions/:id. `emitWhenEmpty` does not apply (a button is always meaningful). An affordance that owns a NAMED UI surface (version chip, stability chip, tag row, ...) does not emit here: it emits on its dedicated `inspector.surface.*` slot (the former payload-level `surface` re-homing field is retired)."
+      },
+      "_SurfaceAction": {
+        "title": "SurfaceActionPayload",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["actionId", "label", "enabled"],
+        "properties": {
+          "actionId": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*/[a-z][a-z0-9-]*$",
+            "description": "Qualified Action id `<plugin>/<action>` the surface dispatches (deterministic surfaces POST /api/actions/:id; probabilistic surfaces submit a job for this extension). The UI selects the surface by SLOT and dispatches this id; it never matches extension ids, so any plugin may claim the surface and disabling the claiming extension removes it (the projection stops)."
+          },
+          "label": { "type": "string", "minLength": 1, "maxLength": 48 },
+          "icon": { "$ref": "#/$defs/IconString" },
+          "severity": { "$ref": "#/$defs/Severity" },
+          "enabled": {
+            "type": "boolean",
+            "description": "Dynamic gate. The surface is ALWAYS emitted while the claiming extension is enabled; `false` renders it disabled (e.g. a stale sidecar disabling the bump chip)."
+          },
+          "disabledReason": {
+            "type": "string",
+            "maxLength": 128,
+            "description": "Tooltip shown when `enabled` is false."
+          },
+          "input": {
+            "type": "object",
+            "description": "Reserved. Static input merged into the dispatch body for parametrized actions that need no user prompt."
+          },
+          "prompt": {
+            "$ref": "#/$defs/payloads/_ActionPrompt",
+            "description": "Declares an input-type prompt the UI collects before dispatching (enum-pick for stability, single-string for tags)."
+          },
+          "confirm": {
+            "type": "boolean",
+            "default": false,
+            "description": "Reserved. Require an extra confirm step before dispatch (destructive actions)."
+          }
+        },
+        "description": "Shared payload of the five `inspector.surface.*` slots (the dedicated-surface family that replaced the retired `ActionButtonPayload.surface` re-homing field, decision 2026-07-23). A slot in this family is a LOGICAL surface: the UI decides where it echoes (the version surface renders as the header chip AND the card's vN label). Single-cardinality per node: when several contributions land on one surface slot, the UI uses the first by contribution priority order and `sm plugins doctor` warns."
+      },
+      "inspector.surface.version": { "$ref": "#/$defs/payloads/_SurfaceAction" },
+      "inspector.surface.stability": { "$ref": "#/$defs/payloads/_SurfaceAction" },
+      "inspector.surface.tags": { "$ref": "#/$defs/payloads/_SurfaceAction" },
+      "inspector.surface.summary": { "$ref": "#/$defs/payloads/_SurfaceAction" },
+      "inspector.surface.auto-tag": { "$ref": "#/$defs/payloads/_SurfaceAction" },
+      "_ActionPrompt": {
+        "title": "ActionPrompt",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["inputType", "paramKey", "label"],
+        "properties": {
+          "inputType": {
+            "$ref": "input-types.schema.json#/$defs/InputTypeName",
+            "description": "Input-type id from the closed catalog. The UI renders the matching control before dispatch (`single-string`, `enum-pick` and `string-list` today; other types degrade to a graceful 'unsupported' notice)."
+          },
+          "paramKey": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 48,
+            "description": "Key under which the collected value is placed in the dispatch `input` body."
+          },
+          "label": { "type": "string", "minLength": 1, "maxLength": 64 },
+          "defaultValue": {
+            "oneOf": [
+              { "type": "string" },
+              { "type": "array", "items": { "type": "string" } }
+            ],
+            "description": "Optional pre-filled value the UI seeds the control with before the user edits (e.g. a node's current tags for a `string-list` edit). String for scalar input-types, string array for list input-types."
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["value", "label"],
+              "properties": {
+                "value": { "type": "string" },
+                "label": { "type": "string" }
+              }
+            },
+            "description": "Choice list for `enum-pick` / `enum-multipick` input types."
+          }
+        },
+        "description": "Reserved (Steps 3+). Declares a parameter the UI prompts for before dispatching the Action, reusing the input-type catalog. Step 1 actions (bump) omit it."
+      },
+      "graph.node.alert": {
+        "title": "AlertPayload",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "icon": { "$ref": "#/$defs/IconString" },
+          "severity": { "$ref": "#/$defs/Severity" },
+          "count": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 99,
+            "description": "Optional badge count rendered next to the icon (1-99; 99+ collapses to '99+'). Omit for an icon-only marker."
+          },
+          "tooltip": { "type": "string", "maxLength": 256 }
+        },
+        "description": "Decoration on the graph node (corner badge / pin). At least one of `icon`, `severity`, `count` is required. 'Empty' for `emitWhenEmpty` is the absence of `icon` AND `count`. Hard cap 1 marker per node per plugin extension (slot config enforces)."
+      },
+      "inspector.body.panel.breakdown": {
+        "title": "BreakdownPayload",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["bars"],
+        "properties": {
+          "bars": {
+            "type": "array",
+            "maxItems": 20,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["label", "value"],
+              "properties": {
+                "label": { "type": "string", "minLength": 1, "maxLength": 32 },
+                "value": { "type": "integer", "minimum": 0 },
+                "tooltip": { "type": "string", "maxLength": 256 }
+              }
+            },
+            "description": "Top-N labeled values rendered as a horizontal bar chart. Hard cap 20 bars (overflow rejected at validation, plugin should pre-truncate). 'Empty' for `emitWhenEmpty` is `bars.length === 0`."
+          }
+        }
+      },
+      "inspector.body.panel.records": {
+        "title": "RecordsPayload",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["columns", "rows"],
+        "properties": {
+          "columns": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 6,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["key", "label"],
+              "properties": {
+                "key": { "type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[a-zA-Z][a-zA-Z0-9_-]*$" },
+                "label": { "type": "string", "minLength": 1, "maxLength": 32 }
+              }
+            },
+            "description": "Column declarations (max 6). Each row's value at `key` is rendered under `label`."
+          },
+          "rows": {
+            "type": "array",
+            "maxItems": 50,
+            "items": {
+              "type": "object",
+              "additionalProperties": {
+                "oneOf": [
+                  { "type": "string", "maxLength": 256 },
+                  { "type": "number" },
+                  { "type": "boolean" },
+                  { "type": "null" }
+                ]
+              }
+            },
+            "description": "Tabular rows (max 50). Cell values are scalar only (string ≤256 chars, number, boolean, or null). 'Empty' for `emitWhenEmpty` is `rows.length === 0`."
+          }
+        }
+      },
+      "inspector.body.panel.tree": {
+        "$ref": "#/$defs/payloads/_TreeNode",
+        "description": "Recursive tree rendered as an indented hierarchy. Hard caps: max depth 6, max 200 total nodes per tree (validator enforces). 'Empty' for `emitWhenEmpty` is the root having no `children`."
+      },
+      "_TreeNode": {
+        "title": "TreeNode",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["label"],
+        "properties": {
+          "label": { "type": "string", "minLength": 1, "maxLength": 64 },
+          "marker": { "$ref": "#/$defs/IconString" },
+          "tooltip": { "type": "string", "maxLength": 256 },
+          "children": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/payloads/_TreeNode" }
+          }
+        }
+      },
+      "inspector.body.panel.key-values": {
+        "title": "KeyValuesPayload",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pairs"],
+        "properties": {
+          "pairs": {
+            "type": "array",
+            "maxItems": 50,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["key", "value"],
+              "properties": {
+                "key": { "type": "string", "minLength": 1, "maxLength": 64 },
+                "value": {
+                  "oneOf": [
+                    { "type": "string", "maxLength": 512 },
+                    { "type": "number" },
+                    { "type": "boolean" },
+                    { "type": "null" }
+                  ]
+                },
+                "tooltip": { "type": "string", "maxLength": 256 }
+              }
+            },
+            "description": "Flat key/value pairs (max 50). Renders as a definition list. 'Empty' for `emitWhenEmpty` is `pairs.length === 0`."
+          }
+        }
+      },
+      "inspector.body.panel.link-list": {
+        "title": "LinkListPayload",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["links"],
+        "properties": {
+          "links": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["path"],
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 512,
+                  "description": "Node path within the scope. Resolved by the UI to a clickable link via `Router.navigate`, never rendered as a raw `[href]` (per the renderer attr-sanitization analyzer)."
+                },
+                "label": { "type": "string", "minLength": 1, "maxLength": 128 },
+                "kind": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 32,
+                  "description": "Optional Provider kind id (informational). The UI may apply per-kind tinting from `kindRegistry`."
+                }
+              }
+            },
+            "description": "List of in-scope node paths (max 100). 'Empty' for `emitWhenEmpty` is `links.length === 0`."
+          }
+        }
+      },
+      "inspector.body.panel.markdown": {
+        "title": "MarkdownPayload",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["markdown"],
+        "properties": {
+          "markdown": {
+            "type": "string",
+            "maxLength": 4096,
+            "description": "Markdown text rendered with a sanitized allow-list (paragraphs, headings up to H3, lists, inline code, fenced code, emphasis, strong, blockquote). HTML, scripts, embedded SVG, image tags, and link autodetection are stripped. Hard cap 4096 chars to keep render cost bounded. 'Empty' for `emitWhenEmpty` is `markdown.trim() === ''`."
+          }
+        }
+      },
+      "topbar.nav.start": {
+        "title": "ScopeStatPayload",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["value"],
+        "properties": {
+          "value": {
+            "oneOf": [
+              { "type": "integer", "minimum": 0 },
+              { "type": "string", "minLength": 1, "maxLength": 64 }
+            ],
+            "description": "Either a non-negative integer or a short string. The UI renders it as a single chip in the topbar."
+          },
+          "label": { "type": "string", "minLength": 1, "maxLength": 32 },
+          "tooltip": { "type": "string", "maxLength": 256 },
+          "severity": { "$ref": "#/$defs/Severity" }
+        },
+        "description": "Single value summarizing the entire scope. Emitted ONCE per scan (not per node). The emit path is `ctx.emitScopeContribution(...)` on the analyzer context (extractors never see it), which is RESERVED in the spec but NOT YET IMPLEMENTED: today's IAnalyzerContext does not expose the callback, so a manifest declaring this slot loads clean but its emissions are deferred until the kernel adds it. See view-slots.md."
+      }
+    }
+  }
+}

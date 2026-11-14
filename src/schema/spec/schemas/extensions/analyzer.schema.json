@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skill-map.ai/spec/v1/extensions/analyzer.schema.json",
+  "title": "ExtensionAnalyzer",
+  "description": "Manifest shape for an `Analyzer` extension. An analyzer consumes the full graph (nodes + links) after all extractors have run, emits `Issue[]`, and MAY emit view contributions to project findings into the UI. Analyzers are dual-mode: `deterministic` analyzers MUST be byte-for-byte reproducible (same graph in → same issues out; time, random, and network are forbidden) and run synchronously inside `sm check` / `sm scan`; `probabilistic` analyzers (finders) execute only as queued jobs, sharing the Action queue verbatim (`sm jobs submit <extension>`, processed by an external agent via `sm jobs claim` + `sm record`). A probabilistic analyzer has NO `evaluate()` (the processing agent does the reasoning) and instead ships files-by-convention: `<analyzer-dir>/prompt.md` plus `<analyzer-dir>/report.schema.json` extending the canonical findings envelope (`findings/report.schema.json`) via `$ref`; missing either is `invalid-manifest`. Its validated report lands in `state_findings` at record time (never as `Issue[]`), output MAY vary across runs, and it NEVER participates in `sm scan`. Each issue a deterministic analyzer emits is tagged with `analyzer_id = <plugin-id>/<extension-id>` by default (the extension's qualified id, derived from structure); analyzers that need to discriminate sub-types append `:<sub-id>` at emit time. Severity is set per-emit (no manifest-level default).",
+  "allOf": [
+    { "$ref": "base.schema.json" },
+    {
+      "if": { "properties": { "mode": { "const": "probabilistic" } }, "required": ["mode"] },
+      "then": { "required": ["probExpectedDurationSeconds"] }
+    }
+  ],
+  "type": "object",
+  "unevaluatedProperties": false,
+  "properties": {
+    "mode": {
+      "type": "string",
+      "enum": ["deterministic", "probabilistic"],
+      "default": "deterministic",
+      "description": "`deterministic` (default): pure code, byte-for-byte reproducible, runs during `sm check` and `sm scan`. `probabilistic`: a finder whose prompt is rendered into a queued job and executed by an external processing agent (there is no `ctx.runner`; skill-map never invokes an LLM); never participates in scan-time pipelines. The kernel rejects probabilistic analyzers that try to register scan-time hooks at load time."
+    },
+    "probExpectedDurationSeconds": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Best-effort ADVISORY estimate of wall-clock duration when `mode=probabilistic`; same contract as `action.schema.json#/properties/probExpectedDurationSeconds`. It never arms an expiry (jobs carry no TTL unless the operator sets one, Decision #139); it feeds the `jobs-overdue` doctor check and display surfaces. Required for `probabilistic`; ignored otherwise."
+    },
+    "phase": {
+      "type": "string",
+      "enum": ["score", "detect", "aggregate"],
+      "default": "detect",
+      "description": "Execution phase the orchestrator schedules this analyzer in. Scan-time concept, meaningful for `deterministic` analyzers only (a `probabilistic` analyzer never enters a scan-time phase; a declared `phase` on one is ignored). `score` runs FIRST and is the ONLY phase permitted to WRITE: it adjusts link confidence via `ctx.adjustConfidence(link, op)`, the orchestrator folds every score-phase op into `link.confidence` (clamped to [0,1], deterministic) before the read-only phases run. `detect` (default) is the main read-only pass that walks the merged graph and emits `Issue[]`. `aggregate` runs LAST and reads `ctx.accumulatedIssues` so an analyzer can compute cross-analyzer summaries (per-node severity totals, etc.) without re-reading the DB. The kernel seeds a 1.0 confidence baseline on every link and dogfoods the `score` phase through two built-in detectors (`core/name-reserved`: reserved -> delta -0.9 -> 0.1; `core/reference-broken`: broken -> delta -0.75 -> 0.25); a clean resolved link keeps the 1.0 baseline. Writing confidence is NOT a filesystem write: the consent-gate / no-write invariant for Analyzers still holds (see `architecture.md` §Analyzer phases)."
+    },
+    "precondition": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional declarative filter. The analyzer runs only when the graph contains at least one node matching every declared sub-filter. Same shape used by Extractor and Action.",
+      "properties": {
+        "kind": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*/[a-z][a-zA-Z0-9]*$"
+          },
+          "description": "Qualified node kinds the analyzer cares about (`<provider-plugin>/<kindName>`). Unknown qualified kinds load OK but emit a `precondition-kind-unknown` warning in `sm plugins doctor`."
+        },
+        "provider": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+          "description": "Provider ids whose nodes the analyzer cares about."
+        }
+      }
+    },
+    "ui": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "../view-slots.schema.json#/$defs/IViewContribution"
+      },
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+      },
+      "description": "Plugin-contributed view contributions. Same contract as Extractor.ui (slot-driven, payload-validated). The analyzer emits per-node payloads via `ctx.emitContribution(<nodePath>, <contributionId>, payload)` during graph evaluation (signature differs from extractor: the nodePath is explicit because analyzers see the full graph, not a single node). Only `extractor` and `analyzer` kinds may declare this field. Renamed from `viewContributions` with the structure-as-truth refactor."
+    }
+  }
+}

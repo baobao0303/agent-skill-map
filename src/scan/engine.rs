@@ -155,7 +155,7 @@ pub fn run_incremental(opts: &ScanOpts, prior: Option<&ScanResult>, prior_runs: 
         .filter_map(|(k, n)| Some((*k, (n.body_hash.as_str(), n.frontmatter_hash.as_str(), n.tokens?))))
         .collect();
     let root = &opts.root;
-    validate_plugins_manifests(root);
+    let mut plugin_rt = crate::plugins::runtime::load(root);
     let ignore = ignore_matcher(opts);
 
     let mut nodes: Vec<Node> = Vec::new();
@@ -369,7 +369,15 @@ pub fn run_incremental(opts: &ScanOpts, prior: Option<&ScanResult>, prior_runs: 
 
     let mut issues = kernel_issues;
     let orphans = orphan_sidecars(root, Some(&ignore));
-    issues.extend(analyze::run(analyze::Ctx {
+    // Project-local plugin analyzers run with the built-ins, ordered by
+    // phase: score ops fold together before any detect analyzer reads
+    // links, then detect, then aggregate.
+    let plugin_score = if plugin_rt.is_empty() {
+        Default::default()
+    } else {
+        plugin_rt.run_phase(&["score"], &nodes, &links, root)
+    };
+    let (score_issues, detect_issues) = analyze::run(analyze::Ctx {
         nodes: &nodes,
         links: &mut links,
         reserved_paths: &reserved,
@@ -378,100 +386,21 @@ pub fn run_incremental(opts: &ScanOpts, prior: Option<&ScanResult>, prior_runs: 
         rejections: &rejections,
         orphan_sidecars: &orphans,
         ignored_references: &opts.ignored_references,
-    }));
-
-    // Score phase confidence hook
-    let plugins_dir = root.join(".skill-map/plugins");
-    if plugins_dir.is_dir() {
-        let scope = crate::scope::Scope::new(root.to_path_buf());
-        if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
-            let mut score_adjustments: Vec<(String, String, String, f64)> = Vec::new();
-            for ent in entries.flatten() {
-                let p_name = ent.file_name().to_string_lossy().to_string();
-                if !scope.is_plugin_trusted(&p_name) {
-                    continue;
-                }
-                let analyzers_dir = ent.path().join("analyzers");
-                if analyzers_dir.is_dir() {
-                    if let Ok(a_entries) = std::fs::read_dir(analyzers_dir) {
-                        for a_ent in a_entries.flatten() {
-                            let a_name = a_ent.file_name().to_string_lossy().to_string();
-                            let js_file = a_ent.path().join("index.js");
-                            if let Ok(txt) = std::fs::read_to_string(js_file) {
-                                let has_score_phase = txt.contains("phase: 'score'")
-                                    || txt.contains("phase: \"score\"")
-                                    || txt.contains("phase:'score'")
-                                    || txt.contains("phase:\"score\"");
-                                if has_score_phase {
-                                    // Parse adjustConfidence ops: { kind: '...', value: ... }
-                                    let mut search_from = 0;
-                                    while let Some(pos) = txt[search_from..].find("adjustConfidence") {
-                                        let call_start = search_from + pos;
-                                        if let Some(brace_open) = txt[call_start..].find('{') {
-                                            let obj_start = call_start + brace_open;
-                                            if let Some(brace_close) = txt[obj_start..].find('}') {
-                                                let obj_str = &txt[obj_start..=obj_start + brace_close];
-                                                let mut kind_opt = None;
-                                                for k in &["delta", "set", "floor", "ceil"] {
-                                                    if obj_str.contains(&format!("'{k}'")) || obj_str.contains(&format!("\"{k}\"")) {
-                                                        kind_opt = Some(*k);
-                                                        break;
-                                                    }
-                                                }
-                                                let mut val_opt = None;
-                                                if let Some(val_idx) = obj_str.find("value:") {
-                                                    let rest = obj_str[val_idx + 6..].trim_start();
-                                                    let num_str: String = rest.chars()
-                                                        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
-                                                        .collect();
-                                                    if let Ok(v) = num_str.parse::<f64>() {
-                                                        val_opt = Some(v);
-                                                    }
-                                                }
-                                                if let (Some(kind), Some(val)) = (kind_opt, val_opt) {
-                                                    score_adjustments.push((p_name.clone(), a_name.clone(), kind.to_string(), val));
-                                                }
-                                                search_from = obj_start + brace_close;
-                                                continue;
-                                            }
-                                        }
-                                        search_from = call_start + 16;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if !score_adjustments.is_empty() {
-                score_adjustments.sort_by(|a, b| {
-                    if a.0 != b.0 {
-                        a.0.cmp(&b.0)
-                    } else {
-                        a.1.cmp(&b.1)
-                    }
-                });
-
-                for link in links.iter_mut() {
-                    let mut running = link.confidence;
-                    for (_, _, kind, val) in &score_adjustments {
-                        if kind == "set" { running = *val; }
-                    }
-                    for (_, _, kind, val) in &score_adjustments {
-                        if kind == "delta" { running += *val; }
-                    }
-                    for (_, _, kind, val) in &score_adjustments {
-                        if kind == "floor" { running = running.max(*val); }
-                    }
-                    for (_, _, kind, val) in &score_adjustments {
-                        if kind == "ceil" { running = running.min(*val); }
-                    }
-                    link.confidence = running.clamp(0.0, 1.0);
-                }
-            }
-        }
-    }
+        plugin_ops: &plugin_score.ops,
+    });
+    let plugin_rest = if plugin_rt.is_empty() {
+        Default::default()
+    } else {
+        plugin_rt.run_phase(&["detect", "aggregate"], &nodes, &links, root)
+    };
+    let plugin_issues = |out: crate::plugins::runtime::PhaseOutput| {
+        out.issues.into_iter().filter(|(q, i)| !analyze::plugin_issue_suppressed(&nodes, q, i)).map(|(_, i)| i).collect::<Vec<_>>()
+    };
+    issues.extend(score_issues);
+    issues.extend(plugin_issues(plugin_score));
+    issues.extend(detect_issues);
+    issues.extend(plugin_issues(plugin_rest));
+    drop(plugin_rt);
 
     let renames = match prior {
         Some(p) => detect_renames(p, &nodes, &mut issues, &ignore),
@@ -918,247 +847,6 @@ pub fn orphan_sidecars(root: &Path, ignore: Option<&ignore::gitignore::Gitignore
     let mut out = Vec::new();
     visit(root, root, ignore, &mut out);
     out
-}
-
-fn validate_plugins_manifests(root: &Path) {
-    let plugins_dir = root.join(".skill-map/plugins");
-    if !plugins_dir.is_dir() {
-        return;
-    }
-    const VALID_SLOTS: &[&str] = &[
-        "card.title.right",
-        "card.subtitle.left",
-        "card.footer.left",
-        "card.footer.right",
-        "graph.node.alert",
-        "inspector.header.badge",
-        "inspector.action.button",
-        "inspector.surface.version",
-        "inspector.surface.stability",
-        "inspector.surface.tags",
-        "inspector.surface.summary",
-        "inspector.surface.auto-tag",
-        "inspector.body.panel.breakdown",
-        "inspector.body.panel.records",
-        "inspector.body.panel.tree",
-        "inspector.body.panel.key-values",
-        "inspector.body.panel.link-list",
-        "inspector.body.panel.markdown",
-        "topbar.nav.start",
-    ];
-
-    let Ok(entries) = std::fs::read_dir(&plugins_dir) else { return; };
-    for ent in entries.flatten() {
-        let path = ent.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let p_name = ent.file_name().to_string_lossy().to_string();
-
-        // 1. Check kinds/ against provider-kind schema
-        let kinds_dir = path.join("kinds");
-        if kinds_dir.is_dir() {
-            if let Ok(k_entries) = std::fs::read_dir(&kinds_dir) {
-                for k_ent in k_entries.flatten() {
-                    let k_name = k_ent.file_name().to_string_lossy().to_string();
-                    let kind_json = k_ent.path().join("kind.json");
-                    if kind_json.is_file() {
-                        if let Ok(txt) = std::fs::read_to_string(&kind_json) {
-                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                                let mut errors = Vec::new();
-                                if !v.is_object() {
-                                    errors.push("(root) must be object");
-                                } else {
-                                    if v.get("ui").is_none() {
-                                        errors.push("(root) must have required property 'ui'");
-                                    }
-                                    if let Some(obj) = v.as_object() {
-                                        for key in obj.keys() {
-                                            if key != "ui" && key != "identifiers" && key != "identifierMismatch" {
-                                                errors.push("(root) must NOT have additional properties");
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                                if !errors.is_empty() {
-                                    let mut provider_entry = format!("providers/{p_name}/index.js");
-                                    let providers_dir = path.join("providers");
-                                    if providers_dir.is_dir() {
-                                        if let Ok(mut pe) = std::fs::read_dir(providers_dir) {
-                                            if let Some(Ok(first_p)) = pe.next() {
-                                                provider_entry = format!("providers/{}/index.js", first_p.file_name().to_string_lossy());
-                                            }
-                                        }
-                                    }
-                                    let err_msg = errors.join("; ");
-                                    eprintln!(
-                                        "plugin {p_name} (invalid-manifest), all extensions skipped: Provider kind `{k_name}` (declared at `{provider_entry}`) failed validation in `kinds/{k_name}/kind.json`: {err_msg}. See https://github.com/crystian/skill-map/blob/main/spec/schemas/extensions/provider-kind.schema.json."
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 2. Check all extension types for valid view slots and contribution payloads
-        for ext_kind in &["analyzers", "extractors", "providers", "actions", "formatters", "hooks"] {
-            let k_dir = path.join(ext_kind);
-            if !k_dir.is_dir() {
-                continue;
-            }
-            let Ok(ext_entries) = std::fs::read_dir(k_dir) else { continue; };
-            for e_ent in ext_entries.flatten() {
-                let e_name = e_ent.file_name().to_string_lossy().to_string();
-                let js_file = e_ent.path().join("index.js");
-                let Ok(txt) = std::fs::read_to_string(&js_file) else { continue; };
-
-                // 2a. Slot validity check
-                let mut search_idx = 0;
-                while let Some(slot_idx) = txt[search_idx..].find("slot:") {
-                    let actual_idx = search_idx + slot_idx + 5;
-                    let rest = txt[actual_idx..].trim_start();
-                    if let Some(quote) = rest.chars().next() {
-                        if quote == '\'' || quote == '"' {
-                            let after_quote = &rest[1..];
-                            if let Some(end_quote) = after_quote.find(quote) {
-                                let slot_name = &after_quote[..end_quote];
-                                if !VALID_SLOTS.contains(&slot_name) {
-                                    // Derive the ui property key
-                                    let mut prop_name = "keywords".to_string();
-                                    let before = &txt[..search_idx + slot_idx];
-                                    if let Some(brace) = before.rfind('{') {
-                                        let pre_brace = before[..brace].trim_end();
-                                        if let Some(colon) = pre_brace.rfind(':') {
-                                            let key_candidate = pre_brace[..colon].trim();
-                                            let key: String = key_candidate.chars().rev().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
-                                            let key: String = key.chars().rev().collect();
-                                            if !key.is_empty() {
-                                                prop_name = key;
-                                            }
-                                        } else if let Some(const_idx) = before.rfind("const ") {
-                                            let decl = before[const_idx + 6..].trim_start();
-                                            let name: String = decl.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
-                                            if !name.is_empty() {
-                                                prop_name = name;
-                                            }
-                                        }
-                                    }
-                                    eprintln!(
-                                        "plugin {p_name} (invalid-manifest), all extensions skipped: {ext_kind}/{e_name}/index.js: /ui/{prop_name}/slot is not a valid value. See https://github.com/crystian/skill-map/blob/main/spec/view-slots.md."
-                                    );
-                                }
-                                search_idx = actual_idx + 1 + end_quote;
-                                continue;
-                            }
-                        }
-                    }
-                    search_idx = actual_idx + 1;
-                }
-
-                // 2b. View contribution emissions
-                if txt.contains("emitContribution") {
-                    // Extract declared ui map
-                    let mut declared_ui: HashSet<String> = HashSet::new();
-                    let mut declared_slots: HashMap<String, String> = HashMap::new();
-
-                    // Parse const declarations with slots
-                    for line in txt.lines() {
-                        let trimmed = line.trim();
-                        if trimmed.starts_with("const ") {
-                            if let Some(eq_idx) = trimmed.find('=') {
-                                let var_name = trimmed[6..eq_idx].trim();
-                                if let Some(s_idx) = trimmed.find("slot:") {
-                                    let s_rest = trimmed[s_idx + 5..].trim();
-                                    if let Some(q) = s_rest.chars().next() {
-                                        if q == '\'' || q == '"' {
-                                            if let Some(end_q) = s_rest[1..].find(q) {
-                                                let s_val = &s_rest[1..1 + end_q];
-                                                declared_slots.insert(var_name.to_string(), s_val.to_string());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if let Some(ui_idx) = txt.find("ui:") {
-                        if let Some(open) = txt[ui_idx..].find('{') {
-                            if let Some(close) = txt[ui_idx + open..].find('}') {
-                                let ui_content = &txt[ui_idx + open + 1..ui_idx + open + close];
-                                for part in ui_content.split(',') {
-                                    let key = part.split(':').next().unwrap_or("").trim();
-                                    if !key.is_empty() {
-                                        declared_ui.insert(key.to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Discover scanned node files in root for realistic target mapping
-                    let mut sample_nodes = Vec::new();
-                    fn find_md_files(dir: &Path, rel_base: &Path, acc: &mut Vec<String>) {
-                        if let Ok(entries) = std::fs::read_dir(dir) {
-                            for e in entries.flatten() {
-                                let p = e.path();
-                                if p.is_dir() {
-                                    let name = e.file_name().to_string_lossy().to_string();
-                                    if !name.starts_with('.') && name != "node_modules" {
-                                        find_md_files(&p, rel_base, acc);
-                                    }
-                                } else if p.is_file() {
-                                    if let Some(ext) = p.extension() {
-                                        if ext == "md" {
-                                            if let Ok(rel) = p.strip_prefix(rel_base) {
-                                                acc.push(rel.to_string_lossy().to_string());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    find_md_files(root, root, &mut sample_nodes);
-                    let target_node = sample_nodes.first().cloned().unwrap_or_else(|| "notes/example.md".to_string());
-
-                    // Check emitContribution calls
-                    let mut emit_search = 0;
-                    while let Some(pos) = txt[emit_search..].find("emitContribution(") {
-                        let args_start = emit_search + pos + 17;
-                        if let Some(args_end) = txt[args_start..].find(");") {
-                            let args_str = &txt[args_start..args_start + args_end];
-                            let parts: Vec<&str> = args_str.splitn(3, ',').collect();
-                            if parts.len() >= 3 {
-                                let target_ref = parts[1].trim();
-                                let payload_str = parts[2].trim();
-
-                                if target_ref.starts_with('{') || !declared_ui.contains(target_ref) {
-                                    eprintln!(
-                                        "⚠  Extension \"{p_name}/{e_name}\" emitted a view contribution on {target_node} whose object is not one declared in its `ui` map (pass the declared const by reference, do not spread or inline it). Contribution dropped."
-                                    );
-                                } else if let Some(slot) = declared_slots.get(target_ref) {
-                                    if slot == "inspector.body.panel.key-values" {
-                                        if payload_str.contains("pairs:") && !payload_str.contains("value:") {
-                                            eprintln!(
-                                                "⚠  Extractor \"{p_name}/{e_name}\" emitted contribution \"{target_ref}\" on {target_node}; payload failed the \"{slot}\" schema: /pairs/0 must have required property 'value'. Contribution dropped."
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            emit_search = args_start + args_end;
-                            continue;
-                        }
-                        emit_search = args_start + 1;
-                    }
-                }
-            }
-        }
-    }
 }
 
 fn recompute_counts(nodes: &mut [Node], links: &[Link], external: &[Link], cached: &HashSet<String>) {

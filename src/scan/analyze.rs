@@ -28,18 +28,35 @@ pub struct Ctx<'a> {
     pub orphan_sidecars: &'a [String],
     /// `core/reference-broken` setting `ignored-references`: (type, value).
     pub ignored_references: &'a [(String, String)],
+    /// Score-phase confidence ops from plugin analyzers, per link index:
+    /// (pluginId, extensionId, op kind, value).
+    pub plugin_ops: &'a [Vec<(String, String, String, f64)>],
 }
 
 const RESERVED_PENALTY: f64 = 0.9;
 const BROKEN_PENALTY: f64 = 0.75;
 
-pub fn run(ctx: Ctx) -> Vec<Issue> {
+/// Returns the (score-phase, detect-phase) issues, operator dismissals
+/// already applied.
+pub fn run(ctx: Ctx) -> (Vec<Issue>, Vec<Issue>) {
     // score phase: compute, then fold before any detect analyzer reads links.
     let mut deltas = vec![0.0f64; ctx.links.len()];
     let reserved = name_reserved(&ctx, &mut deltas);
     let broken = reference_broken(&ctx, &mut deltas);
-    for (link, delta) in ctx.links.iter_mut().zip(deltas) {
-        link.confidence = (link.confidence + delta).clamp(0.0, 1.0);
+    // Every score op (built-in deltas and plugin ops) folds in one pass,
+    // ordered by (pluginId, extensionId), like `applyConfidenceAdjustments`.
+    for (i, (link, delta)) in ctx.links.iter_mut().zip(deltas).enumerate() {
+        match ctx.plugin_ops.get(i).filter(|o| !o.is_empty()) {
+            None => link.confidence = (link.confidence + delta).clamp(0.0, 1.0),
+            Some(ops) => {
+                let mut all = ops.clone();
+                if delta != 0.0 {
+                    all.push(("core".into(), String::new(), "delta".into(), delta));
+                }
+                all.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+                link.confidence = crate::plugins::runtime::fold_confidence(link.confidence, &all);
+            }
+        }
     }
     let ctx = &ctx;
     // registration order (alphabetical by id)
@@ -61,14 +78,27 @@ pub fn run(ctx: Ctx) -> Vec<Issue> {
         issues.into_iter().partition(|i| i.analyzer_id == "name-reserved" || i.analyzer_id == "reference-broken");
     // Operator dismissals apply to every analyzer: an issue whose
     // `data.target` matches an issueSuppressions entry of one of its nodes.
-    score
-        .into_iter()
-        .chain(detect)
-        .filter(|i| {
-            let Some(target) = i.get("data").and_then(|d| d.get("target")).and_then(Value::as_str) else { return true };
-            !i.node_ids.iter().any(|n| is_suppressed(ctx, n, &i.analyzer_id, target))
+    let keep = |i: &Issue| {
+        let Some(target) = i.get("data").and_then(|d| d.get("target")).and_then(Value::as_str) else { return true };
+        !i.node_ids.iter().any(|n| is_suppressed(ctx, n, &i.analyzer_id, target))
+    };
+    (score.into_iter().filter(keep).collect(), detect.into_iter().filter(keep).collect())
+}
+
+/// `isDismissedByOperator` for a plugin analyzer's issue: an
+/// issueSuppressions entry naming the qualified id (or its bare id) and the
+/// issue's `data.target`.
+pub fn plugin_issue_suppressed(nodes: &[Node], qualified: &str, issue: &Issue) -> bool {
+    let Some(target) = issue.get("data").and_then(|d| d.get("target")).and_then(Value::as_str) else { return false };
+    let bare = qualified.rsplit('/').next().unwrap_or(qualified);
+    issue.node_ids.iter().any(|path| {
+        let Some(node) = nodes.iter().find(|n| &n.path == path) else { return false };
+        let entries = node.sidecar.as_ref().and_then(|s| s.get("annotations")).and_then(|a| a.get("issueSuppressions")).and_then(Value::as_array);
+        entries.into_iter().flatten().any(|e| {
+            let a = e.get("analyzer").and_then(Value::as_str).unwrap_or("");
+            e.get("value").and_then(Value::as_str) == Some(target) && (a == qualified || a == bare)
         })
-        .collect()
+    })
 }
 
 /// `formatFinding`: optional `` `subject`:\n`` head, optional `L<n>, …: ` prefix.

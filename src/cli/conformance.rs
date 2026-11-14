@@ -1,12 +1,18 @@
 //! Conformance command family: `sm conformance run`.
+//!
+//! Cases are executed by the spec's own conformance runner (the reference
+//! implementation, `@skill-map/cli/dist/conformance`), driving THIS binary
+//! through a throwaway Node shim: the runner spawns `node <binary> …`, so
+//! the shim forwards argv, stdio, signals and the exit status. Every case
+//! really runs; when the runner or the spec cannot be found the command
+//! fails instead of reporting anything.
 
 use crate::cli::{Cli, CliError};
 use crate::jsjson;
 use crate::scope::Scope;
 use clap::{Args, Subcommand};
-use serde_json::{json, Value};
-use std::fs;
-use std::path::PathBuf;
+use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[derive(Args, Debug, Clone)]
@@ -28,336 +34,264 @@ pub enum ConformanceCommand {
     },
 }
 
-const DEFAULT_CASES: &[&str] = &[
-    "backtick-path-extraction",
-    "bump-report-schema",
-    "catalog-slots-input-types",
-    "claim-race-atomicity",
-    "conformance-result-schema",
-    "duplicate-submit-rejected",
-    "elapsed-time-reporting",
-    "enrich-report-schema",
-    "extension-kind-manifests",
-    "extension-manifest-enable-gate",
-    "extension-mode-routing",
-    "extension-mode-routing-deterministic",
-    "extractor-collision-detection",
-    "extractor-emits-signal",
-    "findings-contract",
-    "findings-contract-kind",
-    "force-does-not-duplicate-live-job",
-    "github-enrichment-recorded",
-    "history-record-schema",
-    "history-stats-schema",
-    "job-document-schema",
-    "jobs-list-omits-nonce",
-    "jobs-submit-agent-gate",
-    "kernel-empty-boot",
-    "markdown-link-rooted",
-    "no-global-scope",
-    "orphan-markdown-fallback",
-    "plugin-manifest-schema",
-    "plugin-missing-ui-rejected",
-    "plugins-doctor-schema",
-    "points-root-fallback",
-    "preamble-bitwise-match",
-    "project-config-schema",
-    "record-findings-envelope-gate",
-    "record-findings-report",
-    "record-nonce-mismatch",
-    "record-report-schema-gate",
-    "record-run-envelope",
-    "record-tags-report",
-    "reference-broken-existence",
-    "reference-broken-ignored",
-    "rest-envelope-schema",
-    "scan-result-schema",
-    "score-phase-confidence",
-    "serve-info-schema",
-    "sidecar-end-to-end",
-    "skill-actions-catalog",
-    "ttl-reap-abandoned",
-    "view-action-button",
-    "view-contribution-payloads",
-    "view-slots-all",
-];
+const ASSERTION_REASON_DISPLAY_CAP: usize = 1000;
 
-fn discover_cases(scope: &Scope) -> Vec<String> {
-    let mut candidates = Vec::new();
-    if let Ok(spec_root) = std::env::var("SM_SPEC_ROOT") {
-        candidates.push(PathBuf::from(spec_root).join("conformance").join("cases"));
+/// Where `@skill-map/spec` and the reference runner live: the env override,
+/// then `oracle/node_modules` next to the project, the cwd, or the binary
+/// (its ancestors cover `target/release/agent-skill` inside the repo).
+fn locate(scope: &Scope) -> (Option<PathBuf>, Option<PathBuf>) {
+    let mut spec_roots: Vec<PathBuf> = Vec::new();
+    for var in ["SM_SPEC_ROOT", "SKILL_MAP_SPEC_ROOT"] {
+        if let Ok(v) = std::env::var(var) {
+            spec_roots.push(PathBuf::from(v));
+        }
     }
-    if let Ok(spec_root) = std::env::var("SKILL_MAP_SPEC_ROOT") {
-        candidates.push(PathBuf::from(spec_root).join("conformance").join("cases"));
-    }
-    candidates.push(scope.root.join("oracle/node_modules/@skill-map/spec/conformance/cases"));
-    candidates.push(scope.root.join("oracle/spec/conformance/cases"));
-    candidates.push(scope.root.join("spec/conformance/cases"));
+    let mut bases: Vec<PathBuf> = vec![scope.root.clone()];
     if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("oracle/node_modules/@skill-map/spec/conformance/cases"));
-        candidates.push(cwd.join("oracle/spec/conformance/cases"));
-        candidates.push(cwd.join("spec/conformance/cases"));
+        bases.push(cwd);
     }
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            candidates.push(parent.join("oracle/node_modules/@skill-map/spec/conformance/cases"));
-            if let Some(grandparent) = parent.parent() {
-                candidates.push(grandparent.join("oracle/node_modules/@skill-map/spec/conformance/cases"));
-                if let Some(great) = grandparent.parent() {
-                    candidates.push(great.join("oracle/node_modules/@skill-map/spec/conformance/cases"));
-                }
-            }
+        bases.extend(exe.ancestors().skip(1).take(4).map(Path::to_path_buf));
+    }
+    for b in &bases {
+        spec_roots.push(b.join("oracle/node_modules/@skill-map/spec"));
+        spec_roots.push(b.join("node_modules/@skill-map/spec"));
+    }
+    let spec = spec_roots.into_iter().find(|p| p.join("conformance/cases").is_dir());
+    let mut runners: Vec<PathBuf> = Vec::new();
+    if let Some(scoped) = spec.as_ref().and_then(|s| s.parent()) {
+        runners.push(scoped.join("cli/dist/conformance/index.js"));
+    }
+    for b in &bases {
+        runners.push(b.join("oracle/node_modules/@skill-map/cli/dist/conformance/index.js"));
+        runners.push(b.join("node_modules/@skill-map/cli/dist/conformance/index.js"));
+    }
+    let runner = runners.into_iter().find(|p| p.is_file());
+    (spec, runner)
+}
+
+fn list_cases(spec: &Path) -> Vec<String> {
+    let mut ids: Vec<String> = std::fs::read_dir(spec.join("conformance/cases"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            name.strip_suffix(".json").filter(|s| !s.starts_with('.')).map(String::from)
+        })
+        .collect();
+    ids.sort();
+    ids
+}
+
+fn runtime_fail(id: &str, why: &str) -> Value {
+    json!({ "id": id, "passed": false, "assertions": [], "stdout": "", "stderr": "", "error": why })
+}
+
+const DRIVER: &str = r#"
+const path = require('path');
+const fs = require('fs');
+(async () => {
+  const [runnerModule, specRoot, binary] = process.argv.slice(1);
+  const { runConformanceCase } = require(runnerModule);
+  const ids = JSON.parse(fs.readFileSync(0, 'utf8'));
+  for (const id of ids) {
+    const casePath = path.join(specRoot, 'conformance', 'cases', `${id}.json`);
+    let row;
+    try {
+      const r = await runConformanceCase({ binary, specRoot, casePath, fixturesRoot: path.join(specRoot, 'conformance', 'fixtures') });
+      row = { id: r.caseId || id, passed: r.passed, assertions: r.assertions || [], stdout: r.stdout || '', stderr: r.stderr || '' };
+    } catch (e) {
+      row = { id, passed: false, assertions: [], stdout: '', stderr: '', error: e instanceof Error ? e.message : String(e) };
+    }
+    process.stdout.write(JSON.stringify(row) + '\n');
+  }
+})();
+"#;
+
+/// Drive the reference runner over `cases`. One result per case, in order;
+/// a case the runner could not execute becomes a `runtime-error` failure.
+fn execute(spec: &Path, runner: &Path, cases: &[String]) -> Vec<Value> {
+    let Ok(exe) = std::env::current_exe() else {
+        return cases.iter().map(|c| runtime_fail(c, "cannot resolve the agent-skill binary path")).collect();
+    };
+    let shim_dir = std::env::temp_dir().join(format!("agent-skill-conformance-{}", std::process::id()));
+    let shim = shim_dir.join("shim.cjs");
+    let shim_src = format!(
+        r#"const {{ spawn }} = require("node:child_process");
+const child = spawn({bin}, process.argv.slice(2), {{ stdio: "inherit" }});
+for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(sig, () => child.kill(sig));
+child.on("error", (e) => {{ process.stderr.write(String(e) + "\n"); process.exit(1); }});
+child.on("exit", (code, signal) => {{
+  if (signal) {{ process.removeAllListeners(signal); process.kill(process.pid, signal); }}
+  else process.exit(code === null ? 1 : code);
+}});
+"#,
+        bin = serde_json::to_string(&exe.to_string_lossy()).unwrap_or_default()
+    );
+    if std::fs::create_dir_all(&shim_dir).and_then(|_| std::fs::write(&shim, shim_src)).is_err() {
+        return cases.iter().map(|c| runtime_fail(c, "cannot write the runner shim to the temp directory")).collect();
+    }
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+    let _cleanup = Cleanup(shim_dir);
 
-    for dir in candidates {
-        if let Ok(entries) = fs::read_dir(&dir) {
-            let mut found = Vec::new();
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        if !stem.starts_with('.') {
-                            found.push(stem.to_string());
-                        }
-                    }
-                }
-            }
-            if !found.is_empty() {
-                found.sort();
-                return found;
-            }
-        }
+    let child = std::process::Command::new("node")
+        .arg("-e")
+        .arg(DRIVER)
+        .arg(runner)
+        .arg(spec)
+        .arg(&shim)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => return cases.iter().map(|c| runtime_fail(c, &format!("cannot start node: {e}"))).collect(),
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        let _ = stdin.write_all(serde_json::to_string(cases).unwrap_or_default().as_bytes());
     }
+    let rows: Vec<Value> = child
+        .wait_with_output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| serde_json::from_str(l).ok()).collect())
+        .unwrap_or_default();
+    // Every requested case gets a row; one the driver never reported failed.
+    cases
+        .iter()
+        .enumerate()
+        .map(|(i, c)| rows.get(i).cloned().unwrap_or_else(|| runtime_fail(c, "the conformance runner exited before reporting this case")))
+        .collect()
+}
 
-    DEFAULT_CASES.iter().map(|s| s.to_string()).collect()
+fn truncate_head(s: &str, cap: usize) -> String {
+    if s.chars().count() <= cap { s.to_string() } else { format!("{}…", s.chars().take(cap).collect::<String>()) }
+}
+
+fn failures_of(row: &Value) -> Vec<Value> {
+    if let Some(e) = row.get("error").and_then(Value::as_str) {
+        return vec![json!({ "type": "runtime-error", "reason": truncate_head(e, ASSERTION_REASON_DISPLAY_CAP) })];
+    }
+    row.get("assertions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|a| a.get("ok") != Some(&Value::Bool(true)))
+        .map(|a| json!({ "type": a.get("type").cloned().unwrap_or(json!("error")), "reason": a.get("reason").cloned().unwrap_or(json!("")) }))
+        .collect()
+}
+
+fn json_error(code: &str, message: &str) -> Result<u8, CliError> {
+    println!("{}", jsjson::to_string(&json!({ "ok": false, "error": { "code": code, "message": message } })));
+    Err(CliError::Raw(String::new(), 2))
+}
+
+fn snippet(header: &str, text: &str) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    eprint!("{header}");
+    for line in trimmed.lines() {
+        eprint!("        {line}\n");
+    }
 }
 
 pub fn run(cli: &Cli, scope: &Scope, args: &ConformanceArgs) -> Result<u8, CliError> {
     let started = Instant::now();
-    match &args.command {
-        ConformanceCommand::Run { case, scope: scope_arg } => {
-            if let Some(s) = scope_arg {
-                if s != "all" && s != "spec" {
-                    if cli.global.json {
-                        println!(
-                            "{}",
-                            jsjson::to_string(&json!({
-                                "ok": false,
-                                "error": {
-                                    "code": "bad-query",
-                                    "message": format!("sm conformance: unknown --scope '{s}'. Available: spec.")
-                                }
-                            }))
-                        );
-                        return Err(CliError::Raw("".into(), 2));
-                    }
-                    return Err(CliError::Raw(
-                        format!("✕  sm conformance: unknown --scope '{s}'. Available: spec."),
-                        2,
-                    ));
-                }
-            }
-
-            let all_cases = discover_cases(scope);
-
-            let active_cases = if let Some(target_case) = case {
-                if !all_cases.iter().any(|c| c == target_case) {
-                    if cli.global.json {
-                        println!(
-                            "{}",
-                            jsjson::to_string(&json!({
-                                "ok": false,
-                                "error": {
-                                    "code": "bad-query",
-                                    "message": format!("no case with id \"{target_case}\" in the selected scope(s)")
-                                }
-                            }))
-                        );
-                        return Err(CliError::Raw("".into(), 2));
-                    }
-                    return Err(CliError::Raw(
-                        format!(
-                            "✕  sm conformance: no case with id \"{target_case}\" in the selected scope(s).\n   Run without --case to see every case id, or widen --scope."
-                        ),
-                        2,
-                    ));
-                }
-                vec![target_case.clone()]
-            } else {
-                all_cases
-            };
-
-            // Run genuine execution via Node conformance runner if available
-            let (results, all_passed) = execute_conformance_cases(scope, &active_cases);
-
-            let mut pass_count = 0;
-            let mut cases_json = Vec::new();
-            for r in &results {
-                let passed = r.get("passed").and_then(|p| p.as_bool()).unwrap_or(true);
-                let id = r.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                let failures = r.get("failures").cloned().unwrap_or_else(|| json!([]));
-                if passed {
-                    pass_count += 1;
-                    cases_json.push(json!({
-                        "id": id,
-                        "status": "pass",
-                        "failures": []
-                    }));
-                } else {
-                    cases_json.push(json!({
-                        "id": id,
-                        "status": "fail",
-                        "failures": failures
-                    }));
-                }
-            }
-
-            let total_count = active_cases.len();
-            let elapsed_ms = started.elapsed().as_millis() as u64;
-
+    let ConformanceCommand::Run { case, scope: scope_arg } = &args.command;
+    if let Some(s) = scope_arg {
+        if s != "all" && s != "spec" {
+            let msg = format!("sm conformance: unknown --scope '{s}'. Available: spec.");
             if cli.global.json {
-                let report = json!({
-                    "ok": true,
-                    "kind": "conformance.result",
-                    "totals": {
-                        "scopes": 1,
-                        "cases": total_count,
-                        "passCount": pass_count,
-                        "failCount": total_count - pass_count
-                    },
-                    "scopes": [
-                        {
-                            "label": "spec",
-                            "passCount": pass_count,
-                            "caseCount": total_count,
-                            "cases": cases_json
-                        }
-                    ],
-                    "elapsedMs": elapsed_ms
-                });
-
-                println!("{}", jsjson::to_string(&report));
-            } else {
-                if !cli.global.quiet {
-                    eprint!("Running conformance scope spec ({total_count} case(s)) ...\n");
-                    for r in &results {
-                        let id = r.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                        let passed = r.get("passed").and_then(|p| p.as_bool()).unwrap_or(true);
-                        if passed {
-                            eprint!("  ok    {id}\n");
-                        } else {
-                            eprint!("  FAIL  {id}\n");
-                            if let Some(failures) = r.get("failures").and_then(|f| f.as_array()) {
-                                for f in failures {
-                                    let t = f.get("type").and_then(|s| s.as_str()).unwrap_or("error");
-                                    let reason = f.get("reason").and_then(|s| s.as_str()).unwrap_or("");
-                                    eprint!("        - [{t}] {reason}\n");
-                                }
-                            }
-                        }
-                    }
-                    eprint!("spec: {pass_count}/{total_count} passed.\n");
-                }
-                print!("sm conformance: {pass_count}/{total_count} passed across 1 scope(s).\n");
+                return json_error("bad-query", &msg);
             }
-
-            if all_passed {
-                Ok(0)
-            } else {
-                Ok(1)
-            }
-        }
-    }
-}
-
-fn execute_conformance_cases(scope: &Scope, cases: &[String]) -> (Vec<Value>, bool) {
-    let mut candidate_spec_roots = Vec::new();
-    if let Ok(sr) = std::env::var("SM_SPEC_ROOT") {
-        candidate_spec_roots.push(PathBuf::from(sr));
-    }
-    candidate_spec_roots.push(scope.root.join("oracle/node_modules/@skill-map/spec"));
-    candidate_spec_roots.push(scope.root.join("oracle/spec"));
-    candidate_spec_roots.push(scope.root.join("spec"));
-
-    let spec_root = candidate_spec_roots.into_iter().find(|p| p.join("conformance/cases").is_dir());
-
-    let mut candidate_runners = Vec::new();
-    candidate_runners.push(scope.root.join("oracle/node_modules/@skill-map/cli/dist/conformance/index.js"));
-    let runner_path = candidate_runners.into_iter().find(|p| p.is_file());
-
-    let shim_path = scope.root.join("conformance/agent-skill-shim.cjs");
-
-    if let (Some(sr), Some(rp)) = (spec_root, runner_path) {
-        if shim_path.is_file() {
-            let script = r#"
-const path = require('path');
-const fs = require('fs');
-async function run() {
-  const runnerModule = process.argv[1];
-  const specRoot = process.argv[2];
-  const binary = process.argv[3];
-  const { runConformanceCase } = require(runnerModule);
-  const casesDir = path.join(specRoot, 'conformance', 'cases');
-  const ids = JSON.parse(fs.readFileSync(0, 'utf8'));
-  const results = [];
-  for (const id of ids) {
-    const casePath = path.join(casesDir, `${id}.json`);
-    try {
-      const r = await runConformanceCase({
-        binary,
-        specRoot,
-        casePath,
-        env: { NO_COLOR: '1', SKILL_MAP_TELEMETRY: '0', SM_NO_UPDATE_CHECK: '1' }
-      });
-      const failures = (r.assertions || []).filter(a => !a.ok).map(a => ({ type: a.type, reason: a.reason || '' }));
-      results.push({ id: r.caseId || id, passed: r.passed, exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr, failures });
-    } catch (e) {
-      results.push({ id, passed: false, exitCode: 1, stdout: '', stderr: String(e), failures: [{ type: 'runtime-error', reason: String(e) }] });
-    }
-  }
-  process.stdout.write(JSON.stringify(results));
-}
-run();
-"#;
-            let child = std::process::Command::new("node")
-                .arg("-e")
-                .arg(script)
-                .arg(&rp)
-                .arg(&sr)
-                .arg(&shim_path)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn();
-
-            if let Ok(mut c) = child {
-                if let Some(mut stdin) = c.stdin.take() {
-                    use std::io::Write;
-                    let _ = stdin.write_all(serde_json::to_string(cases).unwrap_or_default().as_bytes());
-                }
-                if let Ok(out) = c.wait_with_output() {
-                    if out.status.success() {
-                        if let Ok(parsed) = serde_json::from_slice::<Vec<Value>>(&out.stdout) {
-                            let all_pass = parsed.iter().all(|r| r.get("passed").and_then(|p| p.as_bool()).unwrap_or(false));
-                            return (parsed, all_pass);
-                        }
-                    }
-                }
-            }
+            return Err(CliError::Raw(format!("✕  {msg}"), 2));
         }
     }
 
-    // Fallback if node or oracle is not present in environment
-    let fallback_results = cases
-        .iter()
-        .map(|id| {
-            json!({
-                "id": id,
-                "passed": true,
-                "failures": []
-            })
-        })
-        .collect();
-    (fallback_results, true)
+    let (spec, runner) = locate(scope);
+    let (Some(spec), Some(runner)) = (spec, runner) else {
+        let msg = "sm conformance: cannot find the spec conformance suite (@skill-map/spec) and its reference runner (@skill-map/cli/dist/conformance). Install @skill-map/cli under oracle/node_modules, or point SM_SPEC_ROOT at the spec package.";
+        if cli.global.json {
+            return json_error("runner-unavailable", msg);
+        }
+        return Err(CliError::Raw(format!("✕  {msg}"), 2));
+    };
+
+    let all_cases = list_cases(&spec);
+    let active: Vec<String> = match case {
+        Some(target) if !all_cases.iter().any(|c| c == target) => {
+            if cli.global.json {
+                return json_error("bad-query", &format!("no case with id \"{target}\" in the selected scope(s)"));
+            }
+            return Err(CliError::Raw(
+                format!("✕  sm conformance: no case with id \"{target}\" in the selected scope(s).\n   Run without --case to see every case id, or widen --scope."),
+                2,
+            ));
+        }
+        Some(target) => vec![target.clone()],
+        None => all_cases,
+    };
+
+    let human = !cli.global.json && !cli.global.quiet;
+    if human {
+        eprint!("Running conformance scope spec ({} case(s)) ...\n", active.len());
+    }
+    let rows = execute(&spec, &runner, &active);
+    let mut pass = 0usize;
+    let mut reports = Vec::new();
+    for row in &rows {
+        let id = row.get("id").and_then(Value::as_str).unwrap_or("");
+        if row.get("passed") == Some(&Value::Bool(true)) {
+            pass += 1;
+            if human {
+                eprint!("  ok    {id}\n");
+            }
+            reports.push(json!({ "id": id, "status": "pass", "failures": [] }));
+            continue;
+        }
+        let failures = failures_of(row);
+        if human {
+            if let Some(e) = row.get("error").and_then(Value::as_str) {
+                eprint!("✕  sm conformance: {e}\n");
+                eprint!("  FAIL  {id}\n");
+            } else {
+                eprint!("  FAIL  {id}\n");
+                for f in &failures {
+                    let t = f.get("type").and_then(Value::as_str).unwrap_or("error");
+                    let reason = f.get("reason").and_then(Value::as_str).unwrap_or("");
+                    eprint!("        - [{t}] {}\n", truncate_head(reason, ASSERTION_REASON_DISPLAY_CAP));
+                }
+                snippet("        --- stdout ---\n", row.get("stdout").and_then(Value::as_str).unwrap_or(""));
+                snippet("        --- stderr ---\n", row.get("stderr").and_then(Value::as_str).unwrap_or(""));
+            }
+        }
+        reports.push(json!({ "id": id, "status": "fail", "failures": failures }));
+    }
+    let total = active.len();
+    if human {
+        eprint!("spec: {pass}/{total} passed.\n");
+    }
+    if cli.global.json {
+        // Like the original: `ok` describes the run, failures are in the
+        // totals and the exit code.
+        let report = json!({
+            "ok": true,
+            "kind": "conformance.result",
+            "totals": { "scopes": 1, "cases": total, "passCount": pass, "failCount": total - pass },
+            "scopes": [{ "label": "spec", "passCount": pass, "caseCount": total, "cases": reports }],
+            "elapsedMs": started.elapsed().as_millis() as u64
+        });
+        println!("{}", jsjson::to_string(&report));
+    } else {
+        print!("sm conformance: {pass}/{total} passed across 1 scope(s).\n");
+    }
+    Ok(if pass == total { 0 } else { 1 })
 }
