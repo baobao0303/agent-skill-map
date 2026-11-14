@@ -383,30 +383,60 @@ pub fn run(cli: &Cli, _scope: &Scope, db_path: &Path, args: &HistoryArgs) -> Res
         return Ok(0);
     }
 
-    println!("  ID                          STARTED              EXTENSION                     STATUS     DURATION    TOKENS  NODES");
-    for r in &filtered {
-        let started_str = format_iso_utc(r.started_at).chars().take(19).collect::<String>().replace('T', " ") + "Z";
-        let tokens_str = format!("{}/{}", r.tokens_in.unwrap_or(0), r.tokens_out.unwrap_or(0));
-        let duration_str = r.duration_ms.map(|d| format!("{d}ms")).unwrap_or_else(|| "-".to_string());
-        let status_str = match &r.failure_reason {
-            Some(reason) if !reason.is_empty() => format!("{} ({})", r.status, reason),
-            _ => r.status.clone(),
-        };
+    struct HistoryRow {
+        id: String,
+        started: String,
+        extension: String,
+        status: String,
+        duration: String,
+        tokens: String,
+        nodes: String,
+    }
 
+    let rows: Vec<HistoryRow> = filtered
+        .iter()
+        .map(|r| {
+            let started_str = format_iso_utc(r.started_at).chars().take(19).collect::<String>().replace('T', " ") + "Z";
+            let tokens_str = format!("{}/{}", r.tokens_in.unwrap_or(0), r.tokens_out.unwrap_or(0));
+            let duration_str = r.duration_ms.map(format_elapsed).unwrap_or_else(|| "-".to_string());
+            let status_str = match &r.failure_reason {
+                Some(reason) if !reason.is_empty() => format!("{} ({})", r.status, format::sanitize(reason)),
+                _ => r.status.clone(),
+            };
+            HistoryRow {
+                id: truncate_head(&format::sanitize(&r.id), 26),
+                started: started_str,
+                extension: truncate_head(&format::sanitize(&r.extension_id), 28),
+                status: status_str,
+                duration: duration_str,
+                tokens: tokens_str,
+                nodes: r.node_ids.len().to_string(),
+            }
+        })
+        .collect();
+
+    let id_w = rows.iter().map(|r| r.id.chars().count()).max().unwrap_or(2).max(2);
+    let started_w = rows.iter().map(|r| r.started.chars().count()).max().unwrap_or(7).max(7);
+    let ext_w = rows.iter().map(|r| r.extension.chars().count()).max().unwrap_or(9).max(9);
+    let status_w = rows.iter().map(|r| r.status.chars().count()).max().unwrap_or(6).max(6);
+    let dur_w = rows.iter().map(|r| r.duration.chars().count()).max().unwrap_or(3).max(3);
+    let tokens_w = rows.iter().map(|r| r.tokens.chars().count()).max().unwrap_or(6).max(6);
+    let nodes_w = rows.iter().map(|r| r.nodes.chars().count()).max().unwrap_or(5).max(5);
+
+    println!(
+        "  {:<id_w$}  {:<started_w$}  {:<ext_w$}  {:<status_w$}  {:>dur_w$}  {:>tokens_w$}  {:>nodes_w$}",
+        "ID", "STARTED", "EXTENSION", "STATUS", "DUR", "TOKENS", "NODES"
+    );
+
+    for r in &rows {
         println!(
-            "  {:<26}  {:<19}  {:<28}  {:<10}  {:>8}  {:>8}  {:>5}",
-            format::sanitize(&r.id),
-            started_str,
-            format::sanitize(&r.extension_id),
-            format::sanitize(&status_str),
-            duration_str,
-            tokens_str,
-            r.node_ids.len()
+            "  {:<id_w$}  {:<started_w$}  {:<ext_w$}  {:<status_w$}  {:>dur_w$}  {:>tokens_w$}  {:>nodes_w$}",
+            r.id, r.started, r.extension, r.status, r.duration, r.tokens, r.nodes
         );
     }
 
-    let noun = if filtered.len() == 1 { "execution" } else { "executions" };
-    println!("\n  {} {noun}\n  Tip: pass -n <path> to restrict to one node, or --json for machine-readable output.", filtered.len());
+    let noun = if rows.len() == 1 { "execution" } else { "executions" };
+    println!("\n{} {noun}\nTip: `sm history stats` for aggregated counts and top extensions.", rows.len());
     Ok(0)
 }
 
@@ -553,6 +583,7 @@ fn run_stats(
         last_executed_at: i64,
     }
 
+    let mut per_extension_order: Vec<String> = Vec::new();
     let mut per_extension: HashMap<String, ExtAcc> = HashMap::new();
     let mut per_period: HashMap<i64, PeriodAcc> = HashMap::new();
     let mut per_node: HashMap<String, NodeAcc> = HashMap::new();
@@ -599,6 +630,9 @@ fn run_stats(
         }
 
         let ext_key = format!("{}@{}", row.extension_id, row.extension_version);
+        if !per_extension.contains_key(&ext_key) {
+            per_extension_order.push(ext_key.clone());
+        }
         let ext_acc = per_extension.entry(ext_key).or_insert_with(|| ExtAcc {
             extension_id: row.extension_id.clone(),
             extension_version: row.extension_version.clone(),
@@ -642,8 +676,9 @@ fn run_stats(
         }
     }
 
-    let mut tokens_per_extension: Vec<Value> = per_extension
-        .values()
+    let mut tokens_per_extension: Vec<Value> = per_extension_order
+        .iter()
+        .filter_map(|k| per_extension.get(k))
         .map(|acc| {
             let (mean, median) = if acc.durations.is_empty() {
                 (None, None)
@@ -786,10 +821,101 @@ fn run_stats(
     }
 
     let error_pct = format!("{:.1}", global_rate * 100.0);
-    println!("sm history stats: {executions_count} executions · {failed_count} failed · {error_pct}% error rate\n");
-    let since_display = since_ms.map(format_iso_utc).unwrap_or_else(|| "all-time".to_string());
-    println!("  Window: {since_display} to {}", format_iso_utc(until_ms));
-    println!("  Totals: {completed_count} completed, {failed_count} failed, {tokens_in_total}/{tokens_out_total} tokens");
+    println!("sm history stats: {executions_count} executions  ·  {failed_count} failed  ·  {error_pct}% error rate\n");
+
+    println!("  Window");
+    let since_val = since_ms.map(|ms| trim_ms(&format_iso_utc(ms))).unwrap_or_else(|| "(all time)".to_string());
+    let until_val = trim_ms(&format_iso_utc(until_ms));
+    println!("    Since  {since_val}");
+    println!("    Until  {until_val}\n");
+
+    println!("  Totals");
+    let mut parts = Vec::new();
+    if completed_count > 0 { parts.push(format!("{completed_count} ok")); }
+    if failed_count > 0 { parts.push(format!("{failed_count} failed")); }
+    let cancelled = executions_count - completed_count - failed_count;
+    if cancelled > 0 { parts.push(format!("{cancelled} cancelled")); }
+    let breakdown = if parts.is_empty() { String::new() } else { format!(" ({})", parts.join(" · ")) };
+    let dur_str = format_elapsed(duration_ms_total);
+    println!("    Executions  {executions_count}{breakdown}");
+    println!("    Tokens      {tokens_in_total} in / {tokens_out_total} out");
+    println!("    Duration    {dur_str}\n");
+
+    if !tokens_per_extension.is_empty() {
+        println!("  Top extensions (by tokens)");
+        let mut formatted = Vec::new();
+        for ext in tokens_per_extension.iter().take(5) {
+            let id = format!("{}@{}", ext["extensionId"].as_str().unwrap_or(""), ext["extensionVersion"].as_str().unwrap_or(""));
+            let runs = ext["executionsCount"].as_i64().unwrap_or(0);
+            let runs_label = if runs == 1 { "run" } else { "runs" };
+            let t_in = ext["tokensIn"].as_i64().unwrap_or(0);
+            let t_out = ext["tokensOut"].as_i64().unwrap_or(0);
+            formatted.push((id, runs, runs_label, format!("{t_in} in / {t_out} out")));
+        }
+        let max_id_w = formatted.iter().map(|(id, ..)| id.len()).max().unwrap_or(0);
+        for (id, runs, runs_label, tokens) in formatted {
+            println!("    {id:<max_id_w$}  {runs} {runs_label}  ·  {tokens}");
+        }
+        println!();
+    }
+
+    if !top_nodes.is_empty() {
+        println!("  Top nodes");
+        let mut formatted = Vec::new();
+        for n in top_nodes.iter().take(5) {
+            let path = n["nodePath"].as_str().unwrap_or("");
+            let runs = n["executionsCount"].as_i64().unwrap_or(0);
+            let runs_label = if runs == 1 { "run" } else { "runs" };
+            formatted.push((path, runs, runs_label));
+        }
+        let max_path_w = formatted.iter().map(|(path, ..)| path.len()).max().unwrap_or(0);
+        for (path, runs, runs_label) in formatted {
+            println!("    {path:<max_path_w$}  {runs} {runs_label}");
+        }
+        println!();
+    }
+
+    let mut failures: Vec<(&str, usize)> = per_failure_reason.iter().filter(|(_, v)| **v > 0).map(|(k, v)| (k.as_str(), *v)).collect();
+    failures.sort_by_key(|f| f.0);
+    if !failures.is_empty() {
+        println!("  Failures by reason");
+        let max_reason_w = failures.iter().map(|(r, _)| r.len()).max().unwrap_or(0);
+        for (reason, count) in failures {
+            println!("    {reason:<max_reason_w$}  {count}");
+        }
+    }
 
     Ok(0)
+}
+
+fn format_elapsed(ms: i64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if ms < 60000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        let minutes = ms / 60000;
+        let seconds = ((ms % 60000) as f64 / 1000.0).round() as i64;
+        format!("{minutes}m {seconds}s")
+    }
+}
+
+fn truncate_head(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        s.to_string()
+    } else {
+        let mut head: String = chars[..max - 1].iter().collect();
+        head.push('\u{2026}');
+        head
+    }
+}
+
+fn trim_ms(iso: &str) -> String {
+    if let Some((d, rest)) = iso.split_once('T') {
+        let t = rest.split('.').next().unwrap_or(rest).trim_end_matches('Z');
+        format!("{d} {t}Z")
+    } else {
+        iso.to_string()
+    }
 }

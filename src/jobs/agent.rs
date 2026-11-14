@@ -109,6 +109,7 @@ pub fn install(cli: &Cli, scope: &Scope, for_provider: Option<&str>) -> Result<u
         "updated" => println!("✓  sm agent: updated the sm-process-jobs skill at {path} to this CLI's version ({id_s} lens)."),
         _ => println!("✓  sm agent: the sm-process-jobs skill at {path} is already up to date ({id_s} lens)."),
     }
+    scope.warn_if_untrusted_plugins();
     if outcome != "up-to-date" && !cli.global.quiet {
         eprintln!("Any agent booted in this directory can now process the queue; check with `sm agent status`.");
     }

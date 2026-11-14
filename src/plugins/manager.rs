@@ -120,6 +120,8 @@ pub struct DiscoveredPlugin {
     pub unloaded_extensions: Vec<Value>,
     pub manifest_summary: String,
     pub issues: Vec<Value>,
+    pub reason: Option<String>,
+    pub is_user: bool,
 }
 
 fn enabled_by_default(e: &Value) -> bool {
@@ -141,7 +143,7 @@ pub fn discover_plugins(scope: &Scope) -> (Vec<DiscoveredPlugin>, Vec<Discovered
     for p_id in order {
         if let Some(exts) = built_in_map.get(p_id) {
             let mut ext_values = Vec::new();
-            let mut unloaded = Vec::new();
+            let unloaded = Vec::new();
             let mut summaries = Vec::new();
 
             let p_desc = match p_id {
@@ -167,29 +169,20 @@ pub fn discover_plugins(scope: &Scope) -> (Vec<DiscoveredPlugin>, Vec<Discovered
 
                 summaries.push(format!("{kind}:{p_id}/{id}@{version}"));
 
-                if !is_on && matches!(stability, Some("experimental" | "deprecated")) {
-                    unloaded.push(json!({
-                        "id": id,
-                        "kind": kind,
-                        "stability": stability.unwrap_or("experimental"),
-                        "reason": "extension-disabled"
-                    }));
-                } else {
-                    let mut ext_obj = json!({
-                        "id": id,
-                        "kind": kind,
-                        "version": version,
-                        "enabled": is_on,
-                        "description": desc,
-                    });
-                    if let Some(stab) = stability {
-                        ext_obj.as_object_mut().unwrap().insert("stability".into(), json!(stab));
-                    }
-                    if let Some(settings) = e.get("settings") {
-                        ext_obj.as_object_mut().unwrap().insert("settings".into(), settings.clone());
-                    }
-                    ext_values.push(ext_obj);
+                let mut ext_obj = json!({
+                    "id": id,
+                    "kind": kind,
+                    "version": version,
+                    "enabled": is_on,
+                    "description": desc,
+                });
+                if let Some(stab) = stability {
+                    ext_obj.as_object_mut().unwrap().insert("stability".into(), json!(stab));
                 }
+                if let Some(settings) = e.get("settings") {
+                    ext_obj.as_object_mut().unwrap().insert("settings".into(), settings.clone());
+                }
+                ext_values.push(ext_obj);
             }
 
             let plugin_enabled = ext_values.iter().any(|e| e["enabled"].as_bool().unwrap_or(false));
@@ -202,6 +195,8 @@ pub fn discover_plugins(scope: &Scope) -> (Vec<DiscoveredPlugin>, Vec<Discovered
                 unloaded_extensions: unloaded,
                 manifest_summary: summaries.join(", "),
                 issues: Vec::new(),
+                reason: None,
+                is_user: false,
             });
         }
     }
@@ -329,21 +324,30 @@ pub fn discover_plugins(scope: &Scope) -> (Vec<DiscoveredPlugin>, Vec<Discovered
                     }
                 }
 
-                let status = if !issues.is_empty() {
-                    "invalid-manifest".to_string()
+                let is_trusted = scope.is_plugin_trusted(&plugin_id);
+                let (status, enabled, reason) = if !issues.is_empty() {
+                    ("invalid-manifest".to_string(), false, None)
+                } else if !is_trusted {
+                    (
+                        "untrusted".to_string(),
+                        false,
+                        Some(format!("not loaded: project-local plugin is enabled but not trusted in this checkout. Run `sm plugins trust {plugin_id}` to load it.")),
+                    )
                 } else {
-                    "enabled".to_string()
+                    ("enabled".to_string(), true, None)
                 };
 
                 drop_ins.push(DiscoveredPlugin {
                     id: plugin_id,
                     status,
-                    enabled: true,
+                    enabled,
                     description,
                     extensions: ext_values,
                     unloaded_extensions: unloaded,
                     manifest_summary: summaries.join(", "),
                     issues,
+                    reason,
+                    is_user: true,
                 });
             }
         }
@@ -442,16 +446,47 @@ pub fn run(cli: &Cli, scope: &Scope, args: &PluginsArgs) -> Result<u8, CliError>
                 });
                 println!("{}", serde_json::to_string_pretty(&out).unwrap());
             } else {
-                println!("Built-in plugins ({}):", built_ins.len());
-                for p in &built_ins {
-                    println!("  {} ({} extensions)", p.id, p.extensions.len());
+                struct Row {
+                    id: String,
+                    enabled: bool,
+                    ext_count: usize,
+                    source: String,
+                    reason: Option<String>,
                 }
-                if !drop_ins.is_empty() {
-                    println!("\nProject plugins ({}):", drop_ins.len());
-                    for p in &drop_ins {
-                        println!("  {} ({} extensions)", p.id, p.extensions.len());
+                let mut rows = Vec::new();
+                for b in &built_ins {
+                    rows.push(Row {
+                        id: b.id.clone(),
+                        enabled: b.enabled,
+                        ext_count: b.extensions.len(),
+                        source: "built-in".to_string(),
+                        reason: None,
+                    });
+                }
+                for p in &drop_ins {
+                    let inventory = p.extensions.len() + p.unloaded_extensions.len();
+                    rows.push(Row {
+                        id: p.id.clone(),
+                        enabled: p.enabled,
+                        ext_count: inventory,
+                        source: "user".to_string(),
+                        reason: p.reason.clone(),
+                    });
+                }
+
+                let id_width = rows.iter().map(|r| r.id.len()).max().unwrap_or(0);
+                let count_width = rows.iter().map(|r| r.ext_count.to_string().len()).max().unwrap_or(0);
+
+                for r in &rows {
+                    let glyph = if r.enabled { "✓" } else { "✕" };
+                    let id_col = format!("{:<width$}", r.id, width = id_width);
+                    let count_col = format!("{:>width$}", r.ext_count, width = count_width);
+                    println!("  {glyph}  {id_col} {count_col} ext   {}", r.source);
+                    if let Some(reason) = &r.reason {
+                        println!("       {reason}");
                     }
                 }
+                println!("\nTip: `sm plugins list <id>` for a plugin's extensions (kinds, versions, per-extension status), `sm plugins show <plugin>/<ext>` for one extension.");
             }
             Ok(0)
         }
@@ -527,14 +562,54 @@ pub fn run(cli: &Cli, scope: &Scope, args: &PluginsArgs) -> Result<u8, CliError>
             Ok(0)
         }
         PluginsCommand::Trust { ids } => {
+            scope.provision().map_err(|e| CliError::Operational(e.to_string()))?;
+            const BUILT_IN_IDS: &[&str] = &[
+                "core", "claude", "antigravity", "codex", "opencode", "agent-skills", "github", "test-plugin",
+            ];
             for id in ids {
-                println!("✓  Trusted plugin {id}");
+                if BUILT_IN_IDS.contains(&id.as_str()) {
+                    return Err(CliError::Raw(
+                        format!(
+                            "✕  Plugin \"{id}\" is a built-in (or host-locked) and is never import-trust-gated.\n   Import trust applies only to project-local drop-in plugins under .skill-map/plugins/."
+                        ),
+                        5,
+                    ));
+                }
+                scope.grant_plugin_trust(id).map_err(|e| CliError::Operational(e.to_string()))?;
+            }
+            if ids.len() == 1 {
+                print!("trusted: {}\n", ids[0]);
+            } else {
+                print!("trusted: {} plugin(s)\n", ids.len());
+                for id in ids {
+                    print!("  - {id}\n");
+                }
             }
             Ok(0)
         }
         PluginsCommand::Untrust { ids } => {
+            scope.provision().map_err(|e| CliError::Operational(e.to_string()))?;
+            const BUILT_IN_IDS: &[&str] = &[
+                "core", "claude", "antigravity", "codex", "opencode", "agent-skills", "github", "test-plugin",
+            ];
             for id in ids {
-                println!("✓  Untrusted plugin {id}");
+                if BUILT_IN_IDS.contains(&id.as_str()) {
+                    return Err(CliError::Raw(
+                        format!(
+                            "✕  Plugin \"{id}\" is a built-in (or host-locked) and is never import-trust-gated.\n   Import trust applies only to project-local drop-in plugins under .skill-map/plugins/."
+                        ),
+                        5,
+                    ));
+                }
+                scope.revoke_plugin_trust(id).map_err(|e| CliError::Operational(e.to_string()))?;
+            }
+            if ids.len() == 1 {
+                print!("untrusted: {}\n", ids[0]);
+            } else {
+                print!("untrusted: {} plugin(s)\n", ids.len());
+                for id in ids {
+                    print!("  - {id}\n");
+                }
             }
             Ok(0)
         }

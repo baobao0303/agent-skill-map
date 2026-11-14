@@ -95,7 +95,7 @@ impl Scope {
     }
 
     /// `computeScopeGrant`: sha256 over length-prefixed parts.
-    fn grant(&self, key: &str, value: &Value) -> Option<String> {
+    pub fn compute_scope_grant(&self, namespace: &str, subject: &str, value: &Value) -> Option<String> {
         use sha2::{Digest, Sha256};
         use std::os::unix::fs::MetadataExt;
         let meta = std::fs::metadata(self.dir()).ok().filter(|m| m.is_dir())?;
@@ -105,14 +105,104 @@ impl Scope {
         }
         let parts = [
             "skill-map/scope-grant/v1".to_string(),
-            GRANT_NAMESPACE.to_string(),
+            namespace.to_string(),
             meta.ino().to_string(),
             born.to_string(),
-            key.to_string(),
+            subject.to_string(),
             crate::jsjson::to_string(value),
         ];
         let preimage: String = parts.iter().map(|p| format!("{}:{p}", p.encode_utf16().count())).collect();
         Some(hex::encode(Sha256::digest(preimage.as_bytes())))
+    }
+
+    fn grant(&self, key: &str, value: &Value) -> Option<String> {
+        self.compute_scope_grant(GRANT_NAMESPACE, key, value)
+    }
+
+    pub const PLUGIN_TRUST_NAMESPACE: &'static str = "plugin-trust";
+
+    pub fn load_plugin_trust(&self) -> std::collections::HashSet<String> {
+        let lock = read_object(&self.dir().join(LOCK_FILE));
+        let mut trusted = std::collections::HashSet::new();
+        if let Some(bucket) = lock
+            .get("namespaces")
+            .and_then(Value::as_object)
+            .and_then(|ns| ns.get(Self::PLUGIN_TRUST_NAMESPACE))
+            .and_then(Value::as_object)
+        {
+            for (plugin_id, entry) in bucket {
+                if let Some(recorded) = entry.get("grant").and_then(Value::as_str) {
+                    if self
+                        .compute_scope_grant(Self::PLUGIN_TRUST_NAMESPACE, plugin_id, &Value::Bool(true))
+                        .as_deref()
+                        == Some(recorded)
+                    {
+                        trusted.insert(plugin_id.clone());
+                    }
+                }
+            }
+        }
+        trusted
+    }
+
+    pub fn grant_plugin_trust(&self, plugin_id: &str) -> std::io::Result<()> {
+        let Some(grant) = self.compute_scope_grant(Self::PLUGIN_TRUST_NAMESPACE, plugin_id, &Value::Bool(true)) else {
+            return Err(std::io::Error::other(
+                "this filesystem reports no creation time for .skill-map/, so plugin trust cannot be anchored to this checkout",
+            ));
+        };
+        let lock_path = self.dir().join(LOCK_FILE);
+        let lock = read_object(&lock_path);
+        let mut namespaces = lock.get("namespaces").and_then(Value::as_object).cloned().unwrap_or_default();
+        let mut bucket = namespaces.get(Self::PLUGIN_TRUST_NAMESPACE).and_then(Value::as_object).cloned().unwrap_or_default();
+        bucket.insert(plugin_id.into(), serde_json::json!({
+            "grant": grant,
+            "grantedAt": crate::scan::now_ms()
+        }));
+        namespaces.insert(Self::PLUGIN_TRUST_NAMESPACE.into(), Value::Object(bucket));
+        write_json(&lock_path, &serde_json::json!({ "v": 1, "namespaces": namespaces }))
+    }
+
+    pub fn revoke_plugin_trust(&self, plugin_id: &str) -> std::io::Result<()> {
+        let lock_path = self.dir().join(LOCK_FILE);
+        let lock = read_object(&lock_path);
+        let mut namespaces = lock.get("namespaces").and_then(Value::as_object).cloned().unwrap_or_default();
+        if let Some(bucket) = namespaces.get_mut(Self::PLUGIN_TRUST_NAMESPACE).and_then(Value::as_object_mut) {
+            bucket.remove(plugin_id);
+        }
+        write_json(&lock_path, &serde_json::json!({ "v": 1, "namespaces": namespaces }))
+    }
+
+    pub fn is_plugin_trusted(&self, plugin_id: &str) -> bool {
+        self.load_plugin_trust().contains(plugin_id)
+    }
+
+    pub fn warn_if_untrusted_plugins(&self) {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let plugins_dir = self.dir().join("plugins");
+        if !plugins_dir.is_dir() {
+            return;
+        }
+        let trusted = self.load_plugin_trust();
+        let mut never_granted = 0;
+        if let Ok(entries) = std::fs::read_dir(plugins_dir) {
+            for ent in entries.flatten() {
+                if ent.path().is_dir() && ent.path().join("plugin.json").is_file() {
+                    let id = ent.file_name().to_string_lossy().to_string();
+                    if !trusted.contains(&id) {
+                        never_granted += 1;
+                    }
+                }
+            }
+        }
+        if never_granted > 0 {
+            eprintln!(
+                "{never_granted} project-local plugin(s) found in .skill-map/plugins/ but not loaded (untrusted). Their code did NOT run. Read the plugin source (`sm plugins list <id>` summarises the manifest without running anything), then trust what you vetted with `sm plugins trust <id>`."
+            );
+        }
     }
 
     /// Append one NDJSON record to `operations.log`.

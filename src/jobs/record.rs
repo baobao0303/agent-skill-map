@@ -70,6 +70,7 @@ struct ResolvedExtension {
 }
 
 fn resolve_extension(scope: &Scope, extension_id: &str, extension_kind: &str) -> Result<ResolvedExtension, String> {
+    scope.warn_if_untrusted_plugins();
     if extension_id.starts_with("skill:") {
         let schema = validate::schema("https://skill-map.ai/spec/v1/skill-actions/report.schema.json")
             .cloned()
@@ -110,6 +111,9 @@ fn resolve_extension(scope: &Scope, extension_id: &str, extension_kind: &str) ->
         if let Ok(entries) = std::fs::read_dir(plugins_dir) {
             for p in entries.filter_map(Result::ok) {
                 let plugin_name = p.file_name().to_string_lossy().to_string();
+                if !scope.is_plugin_trusted(&plugin_name) {
+                    continue;
+                }
                 let folder = match extension_kind {
                     "action" => "actions",
                     "analyzer" => "analyzers",
