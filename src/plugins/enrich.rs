@@ -309,7 +309,7 @@ fn http_get(url_str: &str, headers: &[(&str, &str)]) -> Result<(u16, String), St
     let mut stream = std::net::TcpStream::connect(&addr).map_err(|e| format!("connect error: {e}"))?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).ok();
 
-    let mut req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: asm\r\nConnection: close\r\n");
+    let mut req = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: agent-skill\r\nConnection: close\r\n");
     for (k, v) in headers {
         req.push_str(&format!("{k}: {v}\r\n"));
     }

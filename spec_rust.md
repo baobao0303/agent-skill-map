@@ -479,13 +479,13 @@ Tất cả các pha từ P1 đến P6 đã hoàn thành đầy đủ, đạt đ�
 
 ```bash
 cargo build --release && cargo test --release
-node conformance/run-spec.mjs asm            # 51/51 passed
-conformance/scenarios/bump.sh asm /tmp/test
-conformance/scenarios/sidecars.sh asm /tmp/test
-conformance/scenarios/issues.sh asm /tmp/test
-conformance/scenarios/orphans.sh asm /tmp/test
-conformance/scenarios/renames.sh asm /tmp/test
-conformance/scenarios/watch.sh asm /tmp/test
+node conformance/run-spec.mjs agent-skill            # 51/51 passed
+conformance/scenarios/bump.sh agent-skill /tmp/test
+conformance/scenarios/sidecars.sh agent-skill /tmp/test
+conformance/scenarios/issues.sh agent-skill /tmp/test
+conformance/scenarios/orphans.sh agent-skill /tmp/test
+conformance/scenarios/renames.sh agent-skill /tmp/test
+conformance/scenarios/watch.sh agent-skill /tmp/test
 ```
 
 ### 18.3 Review 2026-11-14 — Đã hoàn thành sửa chữa (cả 8/8 lỗi đã giải quyết triệt để)
@@ -504,6 +504,6 @@ Tất cả 8 vấn đề đã được sửa bằng triển khai thật (không 
 | 8 | trung | `src/plugins/manager.rs` | `plugins list` khác định dạng và đếm sai | **Đã sửa**: Đếm chuẩn 60 extensions cho core, 1 cho github; format bảng `✓/✕ id N ext built-in/user` kèm tip và lý do chính xác. Thêm `plugins create <kind> <plugin-id>` scaffolding chuẩn 6 kinds. |
 
 Kiểm tra đối chiếu:
-- `node conformance/run-spec.mjs asm`: 51/51 PASS.
+- `node conformance/run-spec.mjs agent-skill`: 51/51 PASS.
 - Kịch bản `conformance/scenarios/jobs.sh` (cả có và không có `TRUST=1`): khớp `sm` byte-for-byte.
 - Các kịch bản `bump.sh`, `sidecars.sh`, `issues.sh`, `orphans.sh`, `renames.sh`: 100% byte-identical.

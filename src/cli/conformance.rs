@@ -286,7 +286,7 @@ fn execute_conformance_cases(scope: &Scope, cases: &[String]) -> (Vec<Value>, bo
     candidate_runners.push(scope.root.join("oracle/node_modules/@skill-map/cli/dist/conformance/index.js"));
     let runner_path = candidate_runners.into_iter().find(|p| p.is_file());
 
-    let shim_path = scope.root.join("conformance/asm-shim.cjs");
+    let shim_path = scope.root.join("conformance/agent-skill-shim.cjs");
 
     if let (Some(sr), Some(rp)) = (spec_root, runner_path) {
         if shim_path.is_file() {

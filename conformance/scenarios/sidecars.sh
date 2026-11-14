@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # P3 sidecars differential (refresh / annotate / prune) on claude-coverage.
-# Usage: sidecars.sh <sm|asm> <workdir>
+# Usage: sidecars.sh <sm|agent-skill> <workdir>
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
-BIN=$([ "$1" = sm ] && echo "$REPO/oracle/node_modules/.bin/sm" || echo "$REPO/target/release/asm")
+BIN=$([ "$1" = sm ] && echo "$REPO/oracle/node_modules/.bin/sm" || echo "$REPO/target/release/agent-skill")
 W=$2
 rm -rf "$W" && cp -a "$REPO/conformance/fixtures/example" "$W" && rm -rf "$W/.skill-map"
 cd "$W" || exit 1

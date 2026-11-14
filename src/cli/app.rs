@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "asm", version, about = "Map, inspect and audit AI-agent markdown ecosystems as a graph")]
+#[command(name = "agent-skill", version, about = "Map, inspect and audit AI-agent markdown ecosystems as a graph")]
 pub struct Cli {
     #[command(flatten)]
     pub global: Global,
@@ -348,7 +348,7 @@ pub fn dispatch(cli: &Cli) -> Result<u8, CliError> {
     let root = std::env::current_dir().map_err(|e| CliError::Operational(e.to_string()))?;
     let scope = Scope::new(root);
     let Some(command) = &cli.command else {
-        return Err(CliError::Usage("no verb given; run `asm --help`".into()));
+        return Err(CliError::Usage("no verb given; run `agent-skill --help`".into()));
     };
     match command {
         Command::Version => version(cli, &scope),
@@ -483,12 +483,12 @@ fn version(cli: &Cli, scope: &Scope) -> Result<u8, CliError> {
         "-".into()
     };
     if cli.global.json {
-        println!("{}", jsjson::to_string(&json!({ "asm": env!("CARGO_PKG_VERSION"), "spec": scan::SPEC_VERSION, "dbSchema": db_schema })));
+        println!("{}", jsjson::to_string(&json!({ "agent-skill": env!("CARGO_PKG_VERSION"), "spec": scan::SPEC_VERSION, "dbSchema": db_schema })));
     } else {
-        println!("  asm        {}", env!("CARGO_PKG_VERSION"));
-        println!("  spec       {}", scan::SPEC_VERSION);
-        println!("  runtime    Rust");
-        println!("  db-schema  {db_schema}");
+        println!("  agent-skill  {}", env!("CARGO_PKG_VERSION"));
+        println!("  spec         {}", scan::SPEC_VERSION);
+        println!("  runtime      Rust");
+        println!("  db-schema    {db_schema}");
     }
     Ok(0)
 }
@@ -539,7 +539,7 @@ fn resolve_lens(scope: &Scope, dry_run: bool, json_mode: bool) -> Result<String,
             Ok(one.to_string())
         }
         many => Err(CliError::Usage(format!(
-            "several provider markers found ({}); pick one with `asm config set activeProvider <id>`",
+            "several provider markers found ({}); pick one with `agent-skill config set activeProvider <id>`",
             many.join(", ")
         ))),
     }

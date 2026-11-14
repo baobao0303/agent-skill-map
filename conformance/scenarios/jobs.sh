@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # P4 job-flow differential: agent install, submit, claim, record, findings,
 # history, plus config / plugins read verbs. Ids, nonces, hashes, times masked.
-# Usage: jobs.sh <sm|asm> <workdir>
+# Usage: jobs.sh <sm|agent-skill> <workdir>
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
-BIN=$([ "$1" = sm ] && echo "$REPO/oracle/node_modules/.bin/sm" || echo "$REPO/target/release/asm")
+BIN=$([ "$1" = sm ] && echo "$REPO/oracle/node_modules/.bin/sm" || echo "$REPO/target/release/agent-skill")
 FIX="$REPO/oracle/node_modules/@skill-map/spec/conformance/fixtures"
 W=$2
 rm -rf "$W" && mkdir -p "$W" && cp -a "$FIX/job-record-chain/." "$W/" && cp -a "$FIX/findings-contract/." "$W/"
