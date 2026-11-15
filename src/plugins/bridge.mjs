@@ -100,13 +100,59 @@ async function evaluate(req) {
   }
 }
 
+async function extract(req) {
+  const exported = modules.get(req.key);
+  const node = req.node;
+  const refs = declaredRefs(exported);
+  const links = [];
+  const enrichments = [];
+  const contributions = [];
+  const signals = [];
+  const virtualNodes = [];
+  const scope = exported?.scope ?? "both";
+  const ctx = {
+    node,
+    body: scope === "frontmatter" ? "" : (req.body ?? ""),
+    frontmatter: scope === "body" ? {} : (req.frontmatter ?? {}),
+    settings: req.settings ?? {},
+    emitLink(link) {
+      if (link && typeof link === "object") links.push(link);
+    },
+    enrichNode(partial) {
+      if (partial && typeof partial === "object") enrichments.push(partial);
+    },
+    emitContribution(ref, payload) {
+      const id = ref !== null && typeof ref === "object" ? refs.get(ref) : undefined;
+      contributions.push({ nodePath: node?.path ?? "", id: id ?? null, payload: payload === undefined ? null : payload });
+    },
+    emitSignal(signal) {
+      if (signal && typeof signal === "object") signals.push(signal);
+    },
+    emitNode(emitted) {
+      if (emitted && typeof emitted === "object") virtualNodes.push(emitted);
+    },
+    log: {
+      debug: (...a) => console.error(...a),
+      info: (...a) => console.error(...a),
+      warn: (...a) => console.error(...a),
+      error: (...a) => console.error(...a),
+    },
+  };
+  try {
+    await exported?.extract?.(ctx);
+    return { links, enrichments, contributions, signals, virtualNodes };
+  } catch (err) {
+    return { error: describe(err), links, enrichments, contributions, signals, virtualNodes };
+  }
+}
+
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
 for await (const line of rl) {
   if (!line.trim()) continue;
   let res;
   try {
     const req = JSON.parse(line);
-    res = req.op === "load" ? await load(req) : await evaluate(req);
+    res = req.op === "load" ? await load(req) : req.op === "extract" ? await extract(req) : await evaluate(req);
   } catch (err) {
     res = { error: describe(err) };
   }

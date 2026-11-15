@@ -2,12 +2,13 @@
 //! (`schema/001_initial.sql`, verbatim) so the original UI/BFF can read it.
 
 use crate::model::{
-    ExternalRef, Issue, Link, Location, Node, OccLocation, Occurrence, OversizedFile, ScanResult, ScannedBy,
-    Stats, Trigger, Triple,
+    Contribution, ContributionError, ExternalRef, Issue, Link, Location, Node, OccLocation, Occurrence,
+    OversizedFile, ScanResult, ScannedBy, Stats, Trigger, Triple,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::Path;
 
 const DDL: &str = include_str!("../schema/001_initial.sql");
@@ -266,6 +267,11 @@ pub fn persist(
     scan: &mut ScanResult,
     renames: &[crate::scan::Rename],
     runs: &[crate::scan::ExtractorRun],
+    contributions: &[Contribution],
+    contribution_errors: &[ContributionError],
+    registered_keys: &HashSet<String>,
+    freshly_run_tuples: &HashSet<String>,
+    enrichments: &[(String, String, Value)],
 ) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
     for r in renames {
@@ -402,7 +408,177 @@ pub fn persist(
             schema_fingerprint(),
         ],
     )?;
+    let live_paths: HashSet<String> = scan.nodes.iter().map(|n| n.path.clone()).collect();
+    sweep_orphan_contributions(&tx, &live_paths)?;
+    sweep_catalog_contributions(&tx, registered_keys)?;
+    sweep_per_tuple_contributions(&tx, contributions, freshly_run_tuples)?;
+    upsert_contributions_buffer(&tx, contributions)?;
+    replace_all_scan_contribution_errors(&tx, contribution_errors)?;
+    upsert_node_enrichments(&tx, enrichments, scan.scanned_at)?;
     tx.commit()
+}
+
+fn sweep_orphan_contributions(tx: &Connection, live_paths: &HashSet<String>) -> rusqlite::Result<()> {
+    if live_paths.is_empty() {
+        tx.execute("DELETE FROM scan_contributions", [])?;
+        return Ok(());
+    }
+    let mut stmt = tx.prepare("SELECT DISTINCT node_path FROM scan_contributions")?;
+    let paths: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+    for p in paths {
+        if !live_paths.contains(&p) {
+            tx.execute("DELETE FROM scan_contributions WHERE node_path = ?1", params![p])?;
+        }
+    }
+    Ok(())
+}
+
+fn sweep_catalog_contributions(tx: &Connection, registered_keys: &HashSet<String>) -> rusqlite::Result<()> {
+    if registered_keys.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = tx.prepare("SELECT DISTINCT plugin_id, extension_id, contribution_id FROM scan_contributions")?;
+    let rows: Vec<(String, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    for (p, e, c) in rows {
+        let key = format!("{p}/{e}/{c}");
+        if !registered_keys.contains(&key) {
+            tx.execute(
+                "DELETE FROM scan_contributions WHERE plugin_id = ?1 AND extension_id = ?2 AND contribution_id = ?3",
+                params![p, e, c],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn sweep_per_tuple_contributions(
+    tx: &Connection,
+    contributions: &[Contribution],
+    freshly_run_tuples: &HashSet<String>,
+) -> rusqlite::Result<()> {
+    if freshly_run_tuples.is_empty() {
+        return Ok(());
+    }
+    let mut buffer_keys: HashSet<String> = HashSet::new();
+    for c in contributions {
+        buffer_keys.insert(format!("{}\0{}\0{}\0{}", c.plugin_id, c.extension_id, c.node_path, c.contribution_id));
+    }
+    for tuple in freshly_run_tuples {
+        let parts: Vec<&str> = tuple.split('\0').collect();
+        if parts.len() != 3 {
+            continue;
+        }
+        let (plugin_id, extension_id, node_path) = (parts[0], parts[1], parts[2]);
+        let mut stmt = tx.prepare(
+            "SELECT contribution_id FROM scan_contributions WHERE plugin_id = ?1 AND extension_id = ?2 AND node_path = ?3",
+        )?;
+        let contrib_ids: Vec<String> = stmt
+            .query_map(params![plugin_id, extension_id, node_path], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        for cid in contrib_ids {
+            let key = format!("{plugin_id}\0{extension_id}\0{node_path}\0{cid}");
+            if !buffer_keys.contains(&key) {
+                tx.execute(
+                    "DELETE FROM scan_contributions WHERE plugin_id = ?1 AND extension_id = ?2 AND node_path = ?3 AND contribution_id = ?4",
+                    params![plugin_id, extension_id, node_path, cid],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn upsert_contributions_buffer(tx: &Connection, contributions: &[Contribution]) -> rusqlite::Result<()> {
+    if contributions.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = tx.prepare(
+        "INSERT INTO scan_contributions (plugin_id, extension_id, node_path, contribution_id, slot, payload_json, emitted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT (plugin_id, extension_id, node_path, contribution_id) DO UPDATE SET
+           slot = excluded.slot,
+           payload_json = excluded.payload_json,
+           emitted_at = excluded.emitted_at",
+    )?;
+    for c in contributions {
+        stmt.execute(params![
+            c.plugin_id,
+            c.extension_id,
+            c.node_path,
+            c.contribution_id,
+            c.slot,
+            json(&c.payload),
+            c.emitted_at,
+        ])?;
+    }
+    Ok(())
+}
+
+fn replace_all_scan_contribution_errors(tx: &Connection, errors: &[ContributionError]) -> rusqlite::Result<()> {
+    tx.execute("DELETE FROM scan_contribution_errors", [])?;
+    if errors.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = tx.prepare(
+        "INSERT INTO scan_contribution_errors (plugin_id, extension_id, node_path, reason, message, contribution_id, slot, emitted_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )?;
+    for e in errors {
+        stmt.execute(params![
+            e.plugin_id,
+            e.extension_id,
+            e.node_path,
+            e.reason,
+            e.message,
+            e.contribution_id,
+            e.slot,
+            e.emitted_at,
+        ])?;
+    }
+    Ok(())
+}
+
+fn upsert_node_enrichments(tx: &Connection, enrichments: &[(String, String, Value)], now: i64) -> rusqlite::Result<()> {
+    if enrichments.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = tx.prepare(
+        "INSERT INTO node_enrichments (node_path, extractor_id, body_hash_at_enrichment, value_json, stale, enriched_at, is_probabilistic)
+         VALUES (?1, ?2, '', ?3, 0, ?4, 0)
+         ON CONFLICT(node_path, extractor_id) DO UPDATE SET
+           value_json = excluded.value_json,
+           stale = 0,
+           enriched_at = excluded.enriched_at",
+    )?;
+    for (node_path, extractor_id, val) in enrichments {
+        stmt.execute(params![node_path, extractor_id, json(val), now])?;
+    }
+    Ok(())
+}
+
+pub fn list_contribution_errors(conn: &Connection) -> rusqlite::Result<Vec<ContributionError>> {
+    let mut stmt = conn.prepare(
+        "SELECT plugin_id, extension_id, node_path, reason, message, contribution_id, slot, emitted_at
+         FROM scan_contribution_errors
+         ORDER BY plugin_id ASC, extension_id ASC, node_path ASC, emitted_at ASC",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(ContributionError {
+                plugin_id: r.get(0)?,
+                extension_id: r.get(1)?,
+                node_path: r.get(2)?,
+                reason: r.get(3)?,
+                message: r.get(4)?,
+                contribution_id: r.get(5)?,
+                slot: r.get(6)?,
+                emitted_at: r.get(7)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 fn parse<T: serde::de::DeserializeOwned>(s: Option<String>) -> Option<T> {

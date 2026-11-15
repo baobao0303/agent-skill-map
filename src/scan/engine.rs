@@ -1,7 +1,10 @@
 //! One scan: walk → classify → extract → resolve → analyze (spec_doc §8).
 
 use crate::extract::{self, NodeInput};
-use crate::model::{ExternalRef, Issue, Link, Node, OversizedFile, ScanResult, ScannedBy, Stats, Triple};
+use crate::model::{
+    Contribution, ContributionError, ExternalRef, Issue, Link, Node, OversizedFile, ScanResult, ScannedBy,
+    Stats, Triple,
+};
 use crate::provider::{self, McpDialect, PROVIDERS, Parser};
 use crate::walk::{self, IgnoreLayers, WalkOpts};
 use crate::{analyze, canon_yaml, diagnose, frontmatter, resolve, tokens, validate};
@@ -60,13 +63,18 @@ pub struct Outcome {
     pub result: ScanResult,
     pub renames: Vec<Rename>,
     pub extractor_runs: Vec<ExtractorRun>,
+    pub contributions: Vec<Contribution>,
+    pub contribution_errors: Vec<ContributionError>,
+    pub registered_contribution_keys: HashSet<String>,
+    pub freshly_run_tuples: HashSet<String>,
+    pub enrichments: Vec<(String, String, Value)>,
 }
 
 /// One `scan_extractor_runs` row: the cache key an extractor ran under.
 #[derive(Clone)]
 pub struct ExtractorRun {
     pub node_path: String,
-    pub extractor_id: &'static str,
+    pub extractor_id: String,
     pub body_hash: String,
     pub sidecar_annotations_hash: String,
     pub settings_hash: String,
@@ -265,6 +273,11 @@ pub fn run_incremental(opts: &ScanOpts, prior: Option<&ScanResult>, prior_runs: 
         node.sidecar = Some(overlay);
         let sidecar_hash = sidecar_annotations_hash(node);
         let applicable = applicable_extractors(&opts.lens, &node.kind);
+        let applicable_plugins: Vec<&crate::plugins::runtime::Extractor> = plugin_rt
+            .extractors
+            .iter()
+            .filter(|ex| ex.matches_kind(&node.kind) && ex.matches_provider(&node.provider))
+            .collect();
         let hit = cache_on
             && prior_nodes.get(node.path.as_str()).is_some_and(|p| {
                 (!opts.tokenize || p.tokens.is_some())
@@ -275,6 +288,12 @@ pub fn run_incremental(opts: &ScanOpts, prior: Option<&ScanResult>, prior_runs: 
                         applicable.iter().all(|id| {
                             for_node.and_then(|m| m.get(*id)).is_some_and(|(b, sc, st)| {
                                 *b == node.body_hash && *sc == sidecar_hash && *st == settings_hash(id)
+                            })
+                        }) && applicable_plugins.iter().all(|ex| {
+                            let q = ex.qualified();
+                            let st_hash = sha256_hex(&canon_yaml::dump(&ex.resolved_settings));
+                            for_node.and_then(|m| m.get(&q)).is_some_and(|(b, sc, st)| {
+                                *b == node.body_hash && *sc == sidecar_hash && *st == st_hash
                             })
                         })
                     })
@@ -294,14 +313,26 @@ pub fn run_incremental(opts: &ScanOpts, prior: Option<&ScanResult>, prior_runs: 
             cached_paths.insert(node.path.clone());
         }
         issues.extend(issue);
-        extractor_runs.extend(applicable.into_iter().map(|id| ExtractorRun {
-            node_path: node.path.clone(),
-            extractor_id: id,
-            body_hash: node.body_hash.clone(),
-            sidecar_annotations_hash: sidecar_hash.clone(),
-            settings_hash: settings_hash(id),
-            ran_at,
-        }));
+        for id in applicable {
+            extractor_runs.push(ExtractorRun {
+                node_path: node.path.clone(),
+                extractor_id: id.to_string(),
+                body_hash: node.body_hash.clone(),
+                sidecar_annotations_hash: sidecar_hash.clone(),
+                settings_hash: settings_hash(id),
+                ran_at,
+            });
+        }
+        for ex in applicable_plugins {
+            extractor_runs.push(ExtractorRun {
+                node_path: node.path.clone(),
+                extractor_id: ex.qualified(),
+                body_hash: node.body_hash.clone(),
+                sidecar_annotations_hash: sidecar_hash.clone(),
+                settings_hash: sha256_hex(&canon_yaml::dump(&ex.resolved_settings)),
+                ran_at,
+            });
+        }
     }
     let kernel_issues: Vec<Issue> = node_issues.into_iter().flatten().collect();
 
@@ -323,6 +354,50 @@ pub fn run_incremental(opts: &ScanOpts, prior: Option<&ScanResult>, prior_runs: 
             extract::run(&input, &opts.lens)
         })
         .collect();
+
+    let mut freshly_run_tuples: HashSet<String> = HashSet::new();
+    let mut all_enrichments: Vec<(String, String, Value)> = Vec::new();
+    let mut all_contributions: Vec<Contribution> = Vec::new();
+    let mut all_contribution_errors: Vec<ContributionError> = Vec::new();
+    let mut plugin_links: Vec<Link> = Vec::new();
+
+    for (n, (body, _)) in nodes.iter().zip(bodies.iter()) {
+        if cached_paths.contains(&n.path) {
+            continue;
+        }
+        for id in applicable_extractors(&opts.lens, &n.kind) {
+            let slash = id.find('/').unwrap_or(0);
+            let (plugin, ext) = (&id[..slash], &id[slash + 1..]);
+            freshly_run_tuples.insert(format!("{plugin}\0{ext}\0{}", n.path));
+        }
+
+        let applicable_indices: Vec<usize> = plugin_rt
+            .extractors
+            .iter()
+            .enumerate()
+            .filter(|(_, ex)| ex.matches_kind(&n.kind) && ex.matches_provider(&n.provider))
+            .map(|(i, _)| i)
+            .collect();
+        for idx in applicable_indices {
+            let (plugin_id, id) = {
+                let ex = &plugin_rt.extractors[idx];
+                (ex.plugin_id.clone(), ex.id.clone())
+            };
+            let out = plugin_rt.run_extractor_idx(
+                idx,
+                n,
+                body,
+                n.frontmatter.as_ref().unwrap_or(&Value::Null),
+            );
+            plugin_links.extend(out.links);
+            for (extractor_qualified, val) in out.enrichments {
+                all_enrichments.push((n.path.clone(), extractor_qualified, val));
+            }
+            all_contributions.extend(out.contributions);
+            all_contribution_errors.extend(out.contribution_errors);
+            freshly_run_tuples.insert(format!("{}\0{}\0{}", plugin_id, id, n.path));
+        }
+    }
     let mut signals = Vec::new();
     let mut with_virtual: Vec<Node> = Vec::with_capacity(nodes.len());
     for (node, out) in nodes.into_iter().zip(outputs) {
@@ -358,6 +433,7 @@ pub fn run_incremental(opts: &ScanOpts, prior: Option<&ScanResult>, prior_runs: 
     let (external, mut internal): (Vec<Link>, Vec<Link>) =
         resolved.into_iter().partition(|l| resolve::is_external_url(&l.target));
     reused_links.append(&mut internal);
+    reused_links.extend(plugin_links);
     let internal = reused_links;
     let reserved = resolve::reserved_node_paths(&nodes);
     let mut links = resolve::dedupe_links(internal);
@@ -377,6 +453,9 @@ pub fn run_incremental(opts: &ScanOpts, prior: Option<&ScanResult>, prior_runs: 
     } else {
         plugin_rt.run_phase(&["score"], &nodes, &links, root)
     };
+    all_contributions.extend(plugin_score.contributions);
+    all_contribution_errors.extend(plugin_score.contribution_errors);
+
     let (score_issues, detect_issues) = analyze::run(analyze::Ctx {
         nodes: &nodes,
         links: &mut links,
@@ -393,14 +472,296 @@ pub fn run_incremental(opts: &ScanOpts, prior: Option<&ScanResult>, prior_runs: 
     } else {
         plugin_rt.run_phase(&["detect", "aggregate"], &nodes, &links, root)
     };
-    let plugin_issues = |out: crate::plugins::runtime::PhaseOutput| {
-        out.issues.into_iter().filter(|(q, i)| !analyze::plugin_issue_suppressed(&nodes, q, i)).map(|(_, i)| i).collect::<Vec<_>>()
+    all_contributions.extend(plugin_rest.contributions);
+    all_contribution_errors.extend(plugin_rest.contribution_errors);
+
+    let plugin_issues = |issues: Vec<(String, Issue)>| {
+        issues.into_iter().filter(|(q, i)| !analyze::plugin_issue_suppressed(&nodes, q, i)).map(|(_, i)| i).collect::<Vec<_>>()
     };
     issues.extend(score_issues);
-    issues.extend(plugin_issues(plugin_score));
+    issues.extend(plugin_issues(plugin_score.issues));
     issues.extend(detect_issues);
-    issues.extend(plugin_issues(plugin_rest));
+    issues.extend(plugin_issues(plugin_rest.issues));
+
+    for a in &plugin_rt.analyzers {
+        if !a.contributions.is_empty() {
+            for n in &nodes {
+                freshly_run_tuples.insert(format!("{}\0{}\0{}", a.plugin_id, a.id, n.path));
+            }
+        }
+    }
+
+    let mut registered_keys = plugin_rt.registered_contribution_keys.clone();
     drop(plugin_rt);
+
+    let scope = crate::scope::Scope::new(root.to_path_buf());
+    let allow_bump = crate::bump::extension_enabled(&scope, "core", "node-bump", false) && scope.sidecar_writers_allowed();
+    let builtin_registered_keys = [
+        "claude/tools-counter/count",
+        "core/external-url-counter/count",
+        "core/annotation-stale/staleBadge",
+        "core/annotation-stale/staleIcon",
+        "core/issue-counter/warnCount",
+        "core/issue-counter/errorCount",
+        "core/link-counter/linksIn",
+        "core/link-counter/linksOut",
+        "core/node-stability/experimental",
+        "core/node-stability/deprecated",
+        "core/ai-summarizer-action/summarySurface",
+        "core/ai-tagger-action/autoTagSurface",
+        "core/node-set-tags/editTagsButton",
+    ];
+    for k in builtin_registered_keys {
+        registered_keys.insert(k.to_string());
+    }
+    if allow_bump {
+        registered_keys.insert("core/node-bump/bumpButton".to_string());
+    }
+
+    for node in &nodes {
+        if node.r#virtual == Some(true) {
+            continue;
+        }
+        freshly_run_tuples.insert(format!("core\0ai-summarizer-action\0{}", node.path));
+        freshly_run_tuples.insert(format!("core\0ai-tagger-action\0{}", node.path));
+        freshly_run_tuples.insert(format!("core\0node-set-tags\0{}", node.path));
+        freshly_run_tuples.insert(format!("core\0annotation-stale\0{}", node.path));
+        freshly_run_tuples.insert(format!("core\0issue-counter\0{}", node.path));
+        freshly_run_tuples.insert(format!("core\0link-counter\0{}", node.path));
+        freshly_run_tuples.insert(format!("core\0node-stability\0{}", node.path));
+        if allow_bump {
+            freshly_run_tuples.insert(format!("core\0node-bump\0{}", node.path));
+        }
+
+        all_contributions.push(Contribution {
+            plugin_id: "core".to_string(),
+            extension_id: "ai-summarizer-action".to_string(),
+            node_path: node.path.clone(),
+            contribution_id: "summarySurface".to_string(),
+            slot: "inspector.surface.summary".to_string(),
+            payload: json!({ "actionId": "core/ai-summarizer-action", "label": "Analyze", "icon": "pi-sparkles", "enabled": true }),
+            emitted_at: ran_at,
+        });
+
+        all_contributions.push(Contribution {
+            plugin_id: "core".to_string(),
+            extension_id: "ai-tagger-action".to_string(),
+            node_path: node.path.clone(),
+            contribution_id: "autoTagSurface".to_string(),
+            slot: "inspector.surface.auto-tag".to_string(),
+            payload: json!({ "actionId": "core/ai-tagger-action", "label": "Auto-tag", "icon": "pi-sparkles", "enabled": true }),
+            emitted_at: ran_at,
+        });
+
+        all_contributions.push(Contribution {
+            plugin_id: "core".to_string(),
+            extension_id: "node-set-tags".to_string(),
+            node_path: node.path.clone(),
+            contribution_id: "editTagsButton".to_string(),
+            slot: "inspector.surface.tags".to_string(),
+            payload: json!({ "actionId": "core/node-set-tags", "label": "Edit tags", "icon": "pi-tags", "enabled": true }),
+            emitted_at: ran_at,
+        });
+
+fn overlay_has_version(sidecar: &Value) -> bool {
+    sidecar
+        .get("annotations")
+        .and_then(|a| a.get("version"))
+        .map_or(false, |v| v.is_number())
+}
+
+fn refuses_as_fresh(sidecar: Option<&Value>) -> bool {
+    let Some(s) = sidecar else { return false; };
+    s.get("present") == Some(&Value::Bool(true))
+        && s.get("status").and_then(|st| st.as_str()) == Some("fresh")
+        && overlay_has_version(s)
+}
+
+        if allow_bump {
+            let enabled = !refuses_as_fresh(node.sidecar.as_ref());
+            let mut payload = json!({ "actionId": "core/node-bump", "label": "Bump", "icon": "pi-arrow-up-right", "enabled": enabled });
+            if !enabled {
+                payload["disabledReason"] = json!("No drift to bump.");
+            }
+            all_contributions.push(Contribution {
+                plugin_id: "core".to_string(),
+                extension_id: "node-bump".to_string(),
+                node_path: node.path.clone(),
+                contribution_id: "bumpButton".to_string(),
+                slot: "inspector.surface.bump".to_string(),
+                payload,
+                emitted_at: ran_at,
+            });
+        }
+
+        if let Some(status) = node.sidecar.as_ref().and_then(|s| s.get("status")).and_then(Value::as_str) {
+            if matches!(status, "stale-body" | "stale-frontmatter" | "stale-both") {
+                let tooltip = match status {
+                    "stale-body" => "Sidecar drift since last bump:\n  \u{2022} body\nRun `sm bump <path>` to refresh.",
+                    "stale-frontmatter" => "Sidecar drift since last bump:\n  \u{2022} frontmatter\nRun `sm bump <path>` to refresh.",
+                    _ => "Sidecar drift since last bump:\n  \u{2022} body\n  \u{2022} frontmatter\nRun `sm bump <path>` to refresh.",
+                };
+                all_contributions.push(Contribution {
+                    plugin_id: "core".to_string(),
+                    extension_id: "annotation-stale".to_string(),
+                    node_path: node.path.clone(),
+                    contribution_id: "staleBadge".to_string(),
+                    slot: "inspector.header.badge".to_string(),
+                    payload: json!({ "icon": "pi-clock", "tooltip": tooltip }),
+                    emitted_at: ran_at,
+                });
+                all_contributions.push(Contribution {
+                    plugin_id: "core".to_string(),
+                    extension_id: "annotation-stale".to_string(),
+                    node_path: node.path.clone(),
+                    contribution_id: "staleIcon".to_string(),
+                    slot: "card.footer.right".to_string(),
+                    payload: json!({ "value": 0, "tooltip": tooltip }),
+                    emitted_at: ran_at,
+                });
+            }
+        }
+
+        let mut errors = 0;
+        let mut warns = 0;
+        for iss in &issues {
+            if iss.node_ids.iter().any(|id| id == &node.path) {
+                if iss.severity == "error" {
+                    errors += 1;
+                } else if iss.severity == "warn" {
+                    warns += 1;
+                }
+            }
+        }
+        if errors > 0 {
+            let tooltip = if errors == 1 { "1 error".to_string() } else { format!("{errors} errors") };
+            all_contributions.push(Contribution {
+                plugin_id: "core".to_string(),
+                extension_id: "issue-counter".to_string(),
+                node_path: node.path.clone(),
+                contribution_id: "errorCount".to_string(),
+                slot: "card.footer.right".to_string(),
+                payload: json!({ "value": errors.min(99), "severity": "danger", "tooltip": tooltip }),
+                emitted_at: ran_at,
+            });
+        }
+        if warns > 0 {
+            let tooltip = if warns == 1 { "1 warning".to_string() } else { format!("{warns} warnings") };
+            all_contributions.push(Contribution {
+                plugin_id: "core".to_string(),
+                extension_id: "issue-counter".to_string(),
+                node_path: node.path.clone(),
+                contribution_id: "warnCount".to_string(),
+                slot: "card.footer.right".to_string(),
+                payload: json!({ "value": warns.min(99), "severity": "warn", "tooltip": tooltip }),
+                emitted_at: ran_at,
+            });
+        }
+
+        let mut in_kinds: HashMap<String, usize> = HashMap::new();
+        let mut out_kinds: HashMap<String, usize> = HashMap::new();
+        for l in &links {
+            let target = l.resolved_target.as_deref().unwrap_or(&l.target);
+            if l.source == target || l.source == l.target {
+                continue;
+            }
+            if l.source == node.path {
+                *out_kinds.entry(l.kind.to_string()).or_insert(0) += 1;
+            }
+            if target == node.path {
+                *in_kinds.entry(l.kind.to_string()).or_insert(0) += 1;
+            }
+        }
+        if !out_kinds.is_empty() {
+            let total: usize = out_kinds.values().sum();
+            let mut kinds: Vec<(&String, &usize)> = out_kinds.iter().collect();
+            kinds.sort_by_key(|(k, _)| *k);
+            let mut lines = vec!["out".to_string()];
+            for (k, n) in kinds {
+                lines.push(format!("{k}: {n}"));
+            }
+            all_contributions.push(Contribution {
+                plugin_id: "core".to_string(),
+                extension_id: "link-counter".to_string(),
+                node_path: node.path.clone(),
+                contribution_id: "linksOut".to_string(),
+                slot: "card.footer.left".to_string(),
+                payload: json!({ "value": total.min(99), "tooltip": lines.join("\n") }),
+                emitted_at: ran_at,
+            });
+        }
+        if !in_kinds.is_empty() {
+            let total: usize = in_kinds.values().sum();
+            let mut kinds: Vec<(&String, &usize)> = in_kinds.iter().collect();
+            kinds.sort_by_key(|(k, _)| *k);
+            let mut lines = vec!["in".to_string()];
+            for (k, n) in kinds {
+                lines.push(format!("{k}: {n}"));
+            }
+            all_contributions.push(Contribution {
+                plugin_id: "core".to_string(),
+                extension_id: "link-counter".to_string(),
+                node_path: node.path.clone(),
+                contribution_id: "linksIn".to_string(),
+                slot: "card.footer.left".to_string(),
+                payload: json!({ "value": total.min(99), "tooltip": lines.join("\n") }),
+                emitted_at: ran_at,
+            });
+        }
+
+        let stability = node.sidecar.as_ref().and_then(|s| s.get("annotations")).and_then(|a| a.get("stability")).and_then(Value::as_str);
+        if stability == Some("experimental") {
+            all_contributions.push(Contribution {
+                plugin_id: "core".to_string(),
+                extension_id: "node-stability".to_string(),
+                node_path: node.path.clone(),
+                contribution_id: "experimental".to_string(),
+                slot: "card.footer.right".to_string(),
+                payload: json!({ "value": 0, "tooltip": "Experimental: API may change" }),
+                emitted_at: ran_at,
+            });
+        } else if stability == Some("deprecated") {
+            all_contributions.push(Contribution {
+                plugin_id: "core".to_string(),
+                extension_id: "node-stability".to_string(),
+                node_path: node.path.clone(),
+                contribution_id: "deprecated".to_string(),
+                slot: "card.footer.right".to_string(),
+                payload: json!({ "value": 0, "tooltip": "Deprecated: avoid in new code", "severity": "warn" }),
+                emitted_at: ran_at,
+            });
+        }
+
+        if node.external_refs_count > 0 {
+            all_contributions.push(Contribution {
+                plugin_id: "core".to_string(),
+                extension_id: "external-url-counter".to_string(),
+                node_path: node.path.clone(),
+                contribution_id: "count".to_string(),
+                slot: "card.footer.left".to_string(),
+                payload: json!({ "value": node.external_refs_count.min(99) }),
+                emitted_at: ran_at,
+            });
+        }
+
+        if node.provider == "claude" && node.kind == "agent" {
+            if let Some(tools) = node.frontmatter.as_ref().and_then(|f| f.get("tools")).and_then(Value::as_array) {
+                let names: Vec<&str> = tools.iter().filter_map(Value::as_str).filter(|s| !s.is_empty()).collect();
+                if !names.is_empty() {
+                    let tooltip = names.join(", ");
+                    all_contributions.push(Contribution {
+                        plugin_id: "claude".to_string(),
+                        extension_id: "tools-counter".to_string(),
+                        node_path: node.path.clone(),
+                        contribution_id: "count".to_string(),
+                        slot: "card.footer.left".to_string(),
+                        payload: json!({ "value": names.len().min(99), "tooltip": tooltip }),
+                        emitted_at: ran_at,
+                    });
+                }
+            }
+        }
+    }
 
     let renames = match prior {
         Some(p) => detect_renames(p, &nodes, &mut issues, &ignore),
@@ -433,7 +794,16 @@ pub fn run_incremental(opts: &ScanOpts, prior: Option<&ScanResult>, prior_runs: 
         issues,
     }
     .with_oversized_count();
-    Outcome { result, renames, extractor_runs }
+    Outcome {
+        result,
+        renames,
+        extractor_runs,
+        contributions: all_contributions,
+        contribution_errors: all_contribution_errors,
+        registered_contribution_keys: registered_keys,
+        freshly_run_tuples,
+        enrichments: all_enrichments,
+    }
 }
 
 /// `renames.ts`: body-hash match → silent high-confidence rename; a unique

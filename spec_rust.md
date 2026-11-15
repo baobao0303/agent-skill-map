@@ -504,10 +504,28 @@ Review lại sau `53e4e88` cho thấy lỗi 1, 2, 3 vẫn làm giả: `conforman
 | 8 | trung | `src/plugins/manager.rs` | `plugins list` khác định dạng | (`5e8d620`) đếm đúng, định dạng như `sm`. |
 | 9 | cao | `conformance/agent-skill-shim.cjs` | shim để sót process `serve`, làm `conformance run` treo | `spawn` bất đồng bộ và chuyển tiếp SIGTERM/SIGINT/SIGHUP (`c2e9ebb`). |
 
-Vẫn chưa làm (ghi để biết, không phải lỗi giả):
-- Chỉ chạy analyzer của plugin. Extractor, provider, action, formatter và hook của plugin được import và kiểm manifest (riêng provider chưa kiểm shape) nhưng chưa chạy.
-- Contribution hợp lệ của plugin chưa được lưu vào `scan_contributions`. Contribution built-in cũng chưa được port.
-- `ctx.settings` của plugin luôn là `{}`, chưa resolve từ config.
+### 18.4 Cập nhật 2026-11-15 — Hoàn thành 4 hạng mục runtime plugin & contribution DB
+
+1. **Lưu contribution vào DB**:
+   - Bảng `scan_contributions` lưu đầy đủ contributions hợp lệ từ cả plugin và các built-in extractors/analyzers/actions (`link-counter`, `annotation-stale`, `issue-counter`, `ai-summarizer-action`, `ai-tagger-action`, `node-set-tags`, `node-bump`, `node-stability`, `external-url-counter`, `tools-counter`).
+   - Duy trì dọn dẹp tăng dần qua 4-stage sweep (orphan sweep, catalog sweep, per-tuple sweep, upsert).
+   - Lỗi phát sinh từ payload sai schema hoặc contribution ref chưa khai báo được ghi nhận vào bảng `scan_contribution_errors`. Lệnh `plugins doctor` đọc từ bảng này để hiển thị trên cả định dạng text (nhóm theo plugin, giới hạn 3 mẫu kèm `... and N more`) và `--json`.
+
+2. **Chạy extractor của plugin**:
+   - Port `extract` qua `src/plugins/bridge.mjs` với đầy đủ context affordances (`emitLink`, `enrichNode`, `emitContribution`, `emitSignal`, `emitNode`, `log`).
+   - Tích hợp vào engine scan tăng dần với cache hit check dựa trên sha256 canonical resolved settings.
+
+3. **`ctx.settings` cho plugin**:
+   - Resolve cấu hình theo từng extension từ manifest `settings` và file `.skill-map/settings.json` / `.skill-map/settings.local.json`.
+   - Kiểm tra kiểu dữ liệu với toàn bộ 12 `input-type` (`string-list`, `single-string`, `boolean-flag`, `integer`, `number`, `enum-pick`, `enum-multipick`, `path-glob`, `regex`, `secret`, `key-value-list`, `match-list`).
+   - Fallback về default khai báo và in cảnh báo stderr đúng câu chữ khi giá trị override không hợp lệ.
+
+4. **Kiểm tra manifest cho provider plugin**:
+   - Nhúng `provider.schema.json` từ spec gốc.
+   - Hàm `stripActivityRuntimeFields` loại bỏ `pluginHooksSource` và `mapEvent` trước khi validate qua JSON Schema.
+
+Vẫn chưa làm:
+- Action, formatter và hook của plugin (ngoài extractor và analyzer) được import và kiểm manifest nhưng chưa chạy logic mở rộng riêng.
 - Chạy plugin cần có `node` trên PATH.
 
 Kiểm tra đối chiếu:

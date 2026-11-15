@@ -613,8 +613,16 @@ fn run_scan(cli: &Cli, scope: &Scope, flags: ScanFlags) -> Result<u8, CliError> 
     if changed && prior.is_none() {
         eprint!("--changed: no prior snapshot found; running full scan.\n");
     }
-    let scan::Outcome { mut result, renames, extractor_runs } =
-        scan::run_incremental(&opts, prior.as_ref().map(|p| &p.0), prior.as_ref().filter(|_| !full).map(|p| &p.1), full);
+    let scan::Outcome {
+        mut result,
+        renames,
+        extractor_runs,
+        contributions,
+        contribution_errors,
+        registered_contribution_keys,
+        freshly_run_tuples,
+        enrichments,
+    } = scan::run_incremental(&opts, prior.as_ref().map(|p| &p.0), prior.as_ref().filter(|_| !full).map(|p| &p.1), full);
     if !dry_run {
         let mut conn = store::open(&db, &scope.backups_dir()).map_err(|e| CliError::Operational(e.to_string()))?;
         if result.nodes.is_empty() && !allow_empty {
@@ -625,7 +633,17 @@ fn run_scan(cli: &Cli, scope: &Scope, flags: ScanFlags) -> Result<u8, CliError> 
                 )));
             }
         }
-        store::persist(&mut conn, &mut result, &renames, &extractor_runs).map_err(|e| CliError::Operational(e.to_string()))?;
+        store::persist(
+            &mut conn,
+            &mut result,
+            &renames,
+            &extractor_runs,
+            &contributions,
+            &contribution_errors,
+            &registered_contribution_keys,
+            &freshly_run_tuples,
+            &enrichments,
+        ).map_err(|e| CliError::Operational(e.to_string()))?;
         scope.log_operation("scan", "cli", "ok", &format!("nodes={} issues={}", result.nodes.len(), result.issues.len()));
     }
     let errors = result.issues.iter().filter(|i| i.severity == "error").count();
@@ -704,10 +722,28 @@ fn run_watch(cli: &Cli, scope: &Scope, tokenize: bool, max_scan: Option<u64>, ma
      -> Result<ScanResult, String> {
         let mut opts = scan_opts(scope, lens.clone(), tokenize, max_scan, max_nodes);
         opts.changed = changed;
-        let scan::Outcome { mut result, renames, extractor_runs } =
-            scan::run_incremental(&opts, prior.as_ref().map(|p| &p.0), prior.as_ref().map(|p| &p.1), false);
+        let scan::Outcome {
+            mut result,
+            renames,
+            extractor_runs,
+            contributions,
+            contribution_errors,
+            registered_contribution_keys,
+            freshly_run_tuples,
+            enrichments,
+        } = scan::run_incremental(&opts, prior.as_ref().map(|p| &p.0), prior.as_ref().map(|p| &p.1), false);
         let mut conn = store::open(&db, &scope.backups_dir()).map_err(|e| e.to_string())?;
-        store::persist(&mut conn, &mut result, &renames, &extractor_runs).map_err(|e| e.to_string())?;
+        store::persist(
+            &mut conn,
+            &mut result,
+            &renames,
+            &extractor_runs,
+            &contributions,
+            &contribution_errors,
+            &registered_contribution_keys,
+            &freshly_run_tuples,
+            &enrichments,
+        ).map_err(|e| e.to_string())?;
         scope.log_operation("scan", "watcher", "ok", &format!("nodes={} issues={}", result.nodes.len(), result.issues.len()));
         Ok(result)
     };

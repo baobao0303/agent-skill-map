@@ -138,6 +138,33 @@ impl Issue {
     }
 }
 
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Contribution {
+    pub plugin_id: String,
+    pub extension_id: String,
+    pub node_path: String,
+    pub contribution_id: String,
+    pub slot: String,
+    pub payload: Value,
+    pub emitted_at: i64,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ContributionError {
+    pub plugin_id: String,
+    pub extension_id: String,
+    pub node_path: String,
+    pub reason: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contribution_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
+    pub emitted_at: i64,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScannedBy {

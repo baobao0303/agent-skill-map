@@ -23,6 +23,7 @@ fn registry() -> &'static HashMap<String, Value> {
             include_str!("../schema/spec/schemas/extensions/action.schema.json"),
             include_str!("../schema/spec/schemas/extensions/formatter.schema.json"),
             include_str!("../schema/spec/schemas/extensions/hook.schema.json"),
+            include_str!("../schema/spec/schemas/extensions/provider.schema.json"),
         ];
         raw.iter()
             .map(|t| {

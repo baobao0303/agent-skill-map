@@ -3,12 +3,36 @@
 use crate::bump::extension_enabled;
 use crate::catalog::BUILT_INS;
 use crate::cli::{Cli, CliError};
+use crate::model::ContributionError;
 use crate::scope::Scope;
+use crate::store;
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::LazyLock;
+
+fn wrap_text(s: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for paragraph in s.split('\n') {
+        let mut cur = String::new();
+        for word in paragraph.split_whitespace() {
+            if cur.is_empty() {
+                cur.push_str(word);
+            } else if cur.len() + 1 + word.len() <= width {
+                cur.push(' ');
+                cur.push_str(word);
+            } else {
+                lines.push(cur);
+                cur = word.to_string();
+            }
+        }
+        if !cur.is_empty() {
+            lines.push(cur);
+        }
+    }
+    lines
+}
 
 pub static VIEW_SLOTS_CATALOG: LazyLock<Value> = LazyLock::new(|| {
     json!([
@@ -522,9 +546,39 @@ pub fn run(cli: &Cli, scope: &Scope, args: &PluginsArgs) -> Result<u8, CliError>
                 }
             }
 
+            let contrib_errors = if scope.db_path().exists() {
+                if let Ok(conn) = store::open_existing(&scope.db_path()) {
+                    store::list_contribution_errors(&conn).unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
+            let contrib_errors_json: Vec<Value> = contrib_errors
+                .iter()
+                .map(|e| {
+                    let mut obj = json!({
+                        "pluginId": e.plugin_id,
+                        "extensionId": e.extension_id,
+                        "nodePath": e.node_path,
+                        "reason": e.reason,
+                        "message": e.message,
+                    });
+                    if let Some(cid) = &e.contribution_id {
+                        obj["contributionId"] = json!(cid);
+                    }
+                    if let Some(slot) = &e.slot {
+                        obj["slot"] = json!(slot);
+                    }
+                    obj
+                })
+                .collect();
+
             let loaded_count = enabled_count;
             let report = json!({
-                "ok": issues.is_empty(),
+                "ok": true,
                 "kind": "plugins.doctor",
                 "counts": {
                     "enabled": enabled_count,
@@ -537,7 +591,7 @@ pub fn run(cli: &Cli, scope: &Scope, args: &PluginsArgs) -> Result<u8, CliError>
                 },
                 "issues": issues,
                 "warnings": [],
-                "contributionErrors": [],
+                "contributionErrors": contrib_errors_json,
                 "elapsedMs": elapsed_ms,
             });
 
@@ -548,8 +602,37 @@ pub fn run(cli: &Cli, scope: &Scope, args: &PluginsArgs) -> Result<u8, CliError>
                 println!("  Enabled: {enabled_count}");
                 println!("  Disabled: {disabled_count}");
                 println!("  Loaded: {loaded_count}");
+                if !contrib_errors.is_empty() {
+                    let total = contrib_errors.len();
+                    print!("\n  Runtime contribution errors (last scan) ({total})\n");
+                    let mut by_plugin: Vec<(String, Vec<&ContributionError>)> = Vec::new();
+                    for err in &contrib_errors {
+                        if let Some((_, list)) = by_plugin.iter_mut().find(|(pid, _)| pid == &err.plugin_id) {
+                            list.push(err);
+                        } else {
+                            by_plugin.push((err.plugin_id.clone(), vec![err]));
+                        }
+                    }
+                    for (pid, list) in by_plugin {
+                        let count = list.len();
+                        print!("    ✕  {pid}  ({count})\n");
+                        for err in list.iter().take(3) {
+                            for line in wrap_text(&err.message, 64) {
+                                print!("       {line}\n");
+                            }
+                        }
+                        if count > 3 {
+                            let hidden = count - 3;
+                            print!("       ... and {hidden} more\n");
+                        }
+                    }
+                }
             }
-            Ok(0)
+            if issues.is_empty() && contrib_errors.is_empty() {
+                Ok(0)
+            } else {
+                Ok(1)
+            }
         }
         PluginsCommand::Enable { ids, local, all: _ } => {
             toggle_plugins(scope, ids, true, *local)?;
