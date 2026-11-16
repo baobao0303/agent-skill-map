@@ -528,13 +528,10 @@ fn resolve_lens(scope: &Scope, dry_run: bool, json_mode: bool) -> Result<String,
                 settings.insert("activeProvider".into(), json!(one));
                 settings.insert("activeProviderMarkers".into(), json!([one]));
                 scope.write_settings(&settings).map_err(|e| CliError::Operational(e.to_string()))?;
-                let notice = format!("Auto-detected activeProvider = {one} from filesystem markers; persisted to .skill-map/settings.json.");
-                // stdout carries only the document in --json mode.
-                if json_mode {
-                    eprintln!("{notice}");
-                } else {
-                    println!("{notice}");
-                }
+            }
+            // Announced on stdout like sm, which says nothing in --json mode.
+            if !json_mode {
+                println!("Auto-detected activeProvider = {one} from filesystem markers; persisted to .skill-map/settings.json.");
             }
             Ok(one.to_string())
         }
@@ -577,6 +574,7 @@ fn scan_opts(scope: &Scope, lens: String, tokenize: bool, max_scan: Option<u64>,
         tokenize,
         follow_external_symlinks: false,
         changed: None,
+        announce_plugins: false,
         ignored_references: settings
             .get("plugins")
             .and_then(|p| p.pointer("/core/extensions/reference-broken/settings/ignored-references"))
@@ -607,7 +605,8 @@ fn run_scan(cli: &Cli, scope: &Scope, flags: ScanFlags) -> Result<u8, CliError> 
         scope.provision().map_err(|e| CliError::Operational(e.to_string()))?;
     }
     let lens = resolve_lens(scope, dry_run, cli.global.json)?;
-    let opts = scan_opts(scope, lens, tokenize, max_scan, max_nodes);
+    let mut opts = scan_opts(scope, lens, tokenize, max_scan, max_nodes);
+    opts.announce_plugins = !cli.global.json;
     let db = db_path(cli, scope);
     let prior = load_prior(&db);
     if changed && prior.is_none() {

@@ -46,8 +46,10 @@ pub struct Node {
 #[serde(rename_all = "camelCase")]
 pub struct ExternalRef {
     pub url: String,
-    pub line: u64,
-    pub original_trigger: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_trigger: Option<String>,
 }
 
 #[derive(Serialize, Clone, PartialEq)]
@@ -86,11 +88,13 @@ pub struct Link {
     pub kind: &'static str,
     pub confidence: f64,
     pub sources: Vec<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub raw: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger: Option<Trigger>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<Location>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub occurrences: Vec<Occurrence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_target: Option<String>,

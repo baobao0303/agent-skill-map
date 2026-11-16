@@ -135,6 +135,8 @@ impl Drop for Bridge {
 
 pub struct Runtime {
     bridge: Option<Bridge>,
+    /// Ids of the trusted project-local plugins whose code is loaded.
+    pub executed: Vec<String>,
     pub extractors: Vec<Extractor>,
     pub analyzers: Vec<Analyzer>,
     pub registered_contribution_keys: HashSet<String>,
@@ -163,6 +165,32 @@ pub struct ExtractorOutput {
 
 fn plugin_failure(plugin_id: &str, status: &str, reason: &str) {
     eprintln!("plugin {plugin_id} ({status}), all extensions skipped: {reason}");
+}
+
+/// `kernel/util/logger.ts` at its default `warn` level: a local-time
+/// `HH:MM:SS  ⚠ WARN   message` line on stderr.
+fn warn_log(message: &str) {
+    let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    eprintln!(
+        "{:02}:{:02}:{:02}  \u{26A0} WARN   {}",
+        now.hour(),
+        now.minute(),
+        now.second(),
+        crate::cli::format::sanitize(message)
+    );
+}
+
+/// Resolved settings of a bundled (core) extension: its declarations from the
+/// built-in catalog, read through the same override layers as project plugins.
+pub fn resolve_builtin_settings(scope: &Scope, plugin_id: &str, ext_id: &str) -> Value {
+    let decls = crate::jobs::catalog::BUILT_INS
+        .iter()
+        .find(|m| m.get("pluginId").and_then(Value::as_str) == Some(plugin_id) && m.get("id").and_then(Value::as_str) == Some(ext_id))
+        .and_then(|m| m.get("settings"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let overrides = read_extension_settings_overrides(scope, plugin_id, ext_id);
+    resolve_extension_settings(plugin_id, ext_id, &decls, &overrides)
 }
 
 /// `kinds/<k>/kind.json` against the provider-kind shape (no code runs).
@@ -472,9 +500,9 @@ fn resolve_extension_settings(
                     resolved.insert(setting_id.clone(), candidate.clone());
                 }
                 Err(reason) => {
-                    eprintln!(
+                    warn_log(&format!(
                         "Setting '{setting_id}' for extension '{plugin_id}/{ext_id}' is invalid ({reason}); falling back to the declared default."
-                    );
+                    ));
                     if let Some(fb) = fallback {
                         resolved.insert(setting_id.clone(), fb);
                     }
@@ -522,6 +550,7 @@ struct Entry {
 pub fn load(root: &Path) -> Runtime {
     let mut rt = Runtime {
         bridge: None,
+        executed: Vec::new(),
         extractors: Vec::new(),
         analyzers: Vec::new(),
         registered_contribution_keys: HashSet::new(),
@@ -545,6 +574,7 @@ pub fn load(root: &Path) -> Runtime {
             plugin_failure(&plugin_id, "invalid-manifest", &reason);
             continue;
         }
+        rt.executed.push(plugin_id.clone());
         let mut entries = Vec::new();
         for (folder, kind) in KIND_DIRS {
             let Ok(list) = std::fs::read_dir(path.join(folder)) else { continue };
@@ -766,6 +796,30 @@ fn validate_entry(
     })))
 }
 
+/// `validateLink`: a kind outside the spec's four, or a confidence outside
+/// [0..1], drops the link with skill-map's warning.
+fn check_link(qualified: &str, raw: &Value) -> Result<(), String> {
+    const KINDS: [&str; 4] = ["invokes", "references", "mentions", "points"];
+    let text = |v: &Value| match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let kind = raw.get("kind").map_or_else(|| "undefined".to_string(), text);
+    if !raw.get("kind").and_then(Value::as_str).is_some_and(|k| KINDS.contains(&k)) {
+        return Err(format!(
+            "Extractor \"{qualified}\" emitted a link of kind \"{kind}\", which is not one of the link kinds the spec defines [{}]. Link dropped.",
+            KINDS.join(", ")
+        ));
+    }
+    if let Some(c) = raw.get("confidence") {
+        let valid = c.as_f64().is_some_and(|n| (0.0..=1.0).contains(&n));
+        if !valid {
+            return Err(format!("Extractor {qualified} emitted a Link with confidence {} outside [0..1]; dropped.", text(c)));
+        }
+    }
+    Ok(())
+}
+
 fn parse_link(raw: &Value) -> Option<Link> {
     let source = raw.get("source")?.as_str()?.to_string();
     let target = raw.get("target")?.as_str()?.to_string();
@@ -777,7 +831,8 @@ fn parse_link(raw: &Value) -> Option<Link> {
         "points" => "points",
         _ => return None,
     };
-    let confidence = raw.get("confidence").and_then(Value::as_f64).unwrap_or(0.5);
+    // A missing confidence is `ConfidenceTier.MEDIUM`.
+    let confidence = raw.get("confidence").and_then(Value::as_f64).unwrap_or(0.6);
     if !(0.0..=1.0).contains(&confidence) {
         return None;
     }
@@ -871,8 +926,14 @@ impl Runtime {
         }
         if let Some(links) = resp.get("links").and_then(Value::as_array) {
             for raw_link in links {
+                if let Err(message) = check_link(&extractor.qualified(), raw_link) {
+                    eprintln!("⚠  {message}");
+                    continue;
+                }
                 if let Some(mut link) = parse_link(raw_link) {
-                    if link.sources.is_empty() {
+                    // An explicit empty `sources` is kept (schema-violation reports it).
+                    // Without the key, sm crashes; fall back to the extractor id.
+                    if raw_link.get("sources").is_none() {
                         link.sources = vec![extractor.id.clone()];
                     }
                     out.links.push(link);

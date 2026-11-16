@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skill-map.ai/spec/v1/link.schema.json",
+  "title": "Link",
+  "description": "Directed relation between two nodes, produced by one or more extractors during a scan.",
+  "type": "object",
+  "required": ["source", "target", "kind", "confidence", "sources"],
+  "additionalProperties": false,
+  "properties": {
+    "source": {
+      "type": "string",
+      "description": "`node.path` of the origin."
+    },
+    "target": {
+      "type": "string",
+      "description": "`node.path` of the destination. MAY point to a missing node; analyzers detect broken refs."
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["invokes", "references", "mentions", "points"],
+      "description": "Nature of the relation. `invokes` = execution-level call (e.g. slash command). `references` = explicit link (e.g. wikilink, @-directive). `mentions` = informal textual mention. `points` = relative file path written inside a code region (backtick span / fenced block); coexists with `references` on the same `(source, target)` pair as a separate Link row (no merge, and `core/link-kind-conflict` does not treat the pair as a conflict)."
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Extractor's self-assessed confidence `[0..1]`. Drives UI edge opacity (more confident = more opaque). Migrated from the legacy string union `'high' | 'medium' | 'low'` to a numeric range so callers can express finer granularity than three buckets. Reference scoring (extractor EMIT values, before resolution): `1.0` = structured input (sidecar annotation), `0.95` = unambiguous syntax (`[text](file.md)`), `0.85` = strong signal with one inference (`@file.md`), `0.5` = genuine ambiguity (`@bare-handle`). On the merged graph the post-walk confidence-lift transform (see `architecture.md` §Provider · resolution rules) overrides the emit value: a resolved target lifts to `1.0`, a resolved-but-`virtual` target (e.g. an `mcp://` node reconstructed from frontmatter, not verified on disk) keeps its emit value (an unverified entity is not full certainty), a resolved-but-reserved target drops to `0.1`, and a genuinely-broken target drops to `0.5`, so a dangling edge renders fainter than a resolved one. The named tiers `HIGH = 0.9`, `MEDIUM = 0.6`, `LOW = 0.3` are exposed on the kernel side as the `ConfidenceTier` constants for callers that want to think in buckets. Analyzers MAY filter by confidence threshold."
+    },
+    "sources": {
+      "type": "array",
+      "description": "Extractor ids that produced this link. At least one. Multiple extractors may converge on the same link; kernel merges them.",
+      "minItems": 1,
+      "items": { "type": "string" }
+    },
+    "trigger": {
+      "type": ["object", "null"],
+      "description": "Trigger-style link metadata (e.g. slash-command keyword, @-directive keyword). Null for links without a textual trigger.",
+      "required": ["originalTrigger", "normalizedTrigger"],
+      "additionalProperties": false,
+      "properties": {
+        "originalTrigger": {
+          "type": "string",
+          "description": "Exact string as it appears in the source body."
+        },
+        "normalizedTrigger": {
+          "type": "string",
+          "description": "NFD → strip diacritics → lowercase → hyphen/underscore → space → collapse whitespace → trim. Used for collision detection and lookup."
+        }
+      }
+    },
+    "location": {
+      "type": ["object", "null"],
+      "description": "Where in the source the link was found. Null if the extractor didn't track location. `line` is 1-indexed and FILE-absolute (the frontmatter block is counted, matching the author's editor), inherited from the originating Signal's offset-adjusted `range.line`; it degrades to body-relative only when no file-absolute mapping exists (`bodyField` providers). `offset` remains a byte offset into the BODY text.",
+      "required": ["line"],
+      "additionalProperties": false,
+      "properties": {
+        "line": { "type": "integer", "minimum": 1 },
+        "column": { "type": "integer", "minimum": 1 },
+        "offset": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "raw": {
+      "type": ["string", "null"],
+      "description": "Verbatim matched substring from the source body. Optional, for debugging and UI display."
+    },
+    "occurrences": {
+      "type": "array",
+      "description": "Every syntactic site in the source body that contributed to this edge. One entry per detection. Accumulated by the post-walk dedup when two extractors converge on the same `(source, target, kind, normalizedTrigger)` key. Empty / absent for synthetic links (frontmatter / sidecar-derived). The `core/reference-redundant` analyzer walks this array to flag multi-form references to the same target.",
+      "items": {
+        "type": "object",
+        "required": ["extractor", "originalTrigger"],
+        "additionalProperties": false,
+        "properties": {
+          "extractor": {
+            "type": "string",
+            "description": "Extractor id that observed this occurrence. Matches an entry in the parent link's `sources[]`."
+          },
+          "originalTrigger": {
+            "type": "string",
+            "description": "Verbatim author substring (sigil included)."
+          },
+          "context": {
+            "type": ["string", "null"],
+            "enum": ["code-block", "inline-code", "escaped", null],
+            "description": "Surface context of this occurrence, copied verbatim from the originating Signal's `context`. Absent / null for prose occurrences. The post-walk resolution gate prunes an unresolved trigger-style link (`mentions` / `invokes`) whose every occurrence carries a code-region context (`code-block` / `inline-code`); see architecture.md §Extractor · code-region triggers."
+          },
+          "location": {
+            "type": ["object", "null"],
+            "description": "Position of the occurrence, when the extractor records it. Same semantics as the link-level `location`: `line` is file-absolute, `offset` is a body byte offset.",
+            "required": ["line"],
+            "additionalProperties": false,
+            "properties": {
+              "line": { "type": "integer", "minimum": 1 },
+              "column": { "type": "integer", "minimum": 1 },
+              "offset": { "type": "integer", "minimum": 0 }
+            }
+          }
+        }
+      }
+    },
+    "resolvedTarget": {
+      "type": ["string", "null"],
+      "description": "Node path the link resolved to, per the post-walk `liftResolvedLinkConfidence` transform. Equal to `target` for path-style links; differs for trigger-style links (`@foo`, `/cmd`) where `target` keeps the authored trigger and `resolvedTarget` carries the resolved node path. Absent / null when the link is unresolved (broken)."
+    }
+  }
+}

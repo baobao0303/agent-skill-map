@@ -4,15 +4,16 @@
 //! analyzers run in registration order; their issues are emitted in
 //! registration order overall.
 //!
-//! Not ported: `schema-violation` re-validates the pipeline's own nodes and
-//! links against node/link schemas, which the typed model here guarantees;
-//! `observed-*` need the session journal (phase 6); `issue-counter`,
-//! `link-counter` and `annotation-stale` only emit UI contributions.
+//! `schema-violation` checks links against `link.schema.json` (nodes are not
+//! re-validated: the typed model here guarantees their shape). Not ported:
+//! `observed-*` need the session journal (phase 6); `link-counter` and
+//! `annotation-stale` only emit UI contributions.
 
 use crate::extract::Signal;
 use crate::format::locale_compare;
 use crate::model::{Issue, Link, Node};
 use crate::norm::normalize_trigger;
+use crate::plugins::schema::{format_errors, validate};
 use crate::provider::{self, Identifier};
 use crate::resolve::Rejection;
 use serde_json::{Value, json};
@@ -72,6 +73,7 @@ pub fn run(ctx: Ctx) -> (Vec<Issue>, Vec<Issue>) {
     issues.extend(node_stability(ctx));
     issues.extend(broken);
     issues.extend(reference_redundant(ctx));
+    issues.extend(schema_violation(ctx));
     // The original sorts analyzers by phase before running them, so score
     // issues come first.
     let (score, detect): (Vec<Issue>, Vec<Issue>) =
@@ -607,4 +609,36 @@ fn reference_redundant(ctx: &Ctx) -> Vec<Issue> {
         );
     }
     issues
+}
+
+const LINK_SCHEMA: &str = "https://skill-map.ai/spec/v1/link.schema.json";
+
+/// `core/schema-violation` for links: the record `toLinkForSchema` builds
+/// (no occurrences, no resolved target), checked against `link.schema.json`.
+fn schema_violation(ctx: &Ctx) -> Vec<Issue> {
+    ctx.links
+        .iter()
+        .filter_map(|l| {
+            let record = json!({
+                "source": l.source,
+                "target": l.target,
+                "kind": l.kind,
+                "confidence": l.confidence,
+                "sources": l.sources,
+                "trigger": l.trigger.as_ref().map(|t| json!({ "originalTrigger": t.original_trigger, "normalizedTrigger": t.normalized_trigger })),
+                "location": l.location.as_ref().map(|x| json!({ "line": x.line, "offset": x.offset })),
+                "raw": l.raw,
+            });
+            let errors = validate(LINK_SCHEMA, &record);
+            if errors.is_empty() {
+                return None;
+            }
+            let body = format!("Link failed schema validation; {}", format_errors(&errors));
+            Some(
+                Issue::new("schema-violation", "error", vec![l.source.clone()], format_finding(Some(&l.target), &[], &body))
+                    .fix("Correct the fields the message lists so the record satisfies its schema; the error names each offending path.")
+                    .data(json!({ "target": "link", "source": l.source, "to": l.target })),
+            )
+        })
+        .collect()
 }

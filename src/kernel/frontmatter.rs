@@ -52,6 +52,16 @@ fn split(text: &str) -> Option<(&str, &str)> {
 
 /// Load one YAML document. `Ok(None)` for an empty document.
 pub fn load(raw: &str) -> Result<Option<Value>, String> {
+    match load_once(raw) {
+        Err(err) => match explicit_long_keys(raw) {
+            Some(rewritten) => load_once(&rewritten).map_err(|_| err),
+            None => Err(err),
+        },
+        ok => ok,
+    }
+}
+
+fn load_once(raw: &str) -> Result<Option<Value>, String> {
     let mut builder = Builder::default();
     let mut parser = Parser::new_from_str(raw);
     parser.load(&mut builder, false).map_err(|e| e.to_string())?;
@@ -59,6 +69,27 @@ pub fn load(raw: &str) -> Result<Option<Value>, String> {
         return Err(err);
     }
     Ok(builder.root)
+}
+
+/// yaml-rust2 caps implicit keys at 1024 characters (YAML 1.2 §8.2.2), js-yaml
+/// does not. Rewrites each top-level `key: value` line whose key is longer as
+/// the explicit `? key` / `: value` form, which has no such cap. `None` when no
+/// line is affected.
+fn explicit_long_keys(raw: &str) -> Option<String> {
+    let mut changed = false;
+    let mut out = String::with_capacity(raw.len() + 16);
+    for line in raw.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\n', '\r']);
+        let eol = &line[body.len()..];
+        match body.find(": ") {
+            Some(pos) if pos > 1024 && !body.starts_with(['"', '\'', '?', '#', ' ', '\t']) => {
+                changed = true;
+                out.push_str(&format!("? {}\n: {}{eol}", &body[..pos], &body[pos + 2..]));
+            }
+            _ => out.push_str(line),
+        }
+    }
+    changed.then_some(out)
 }
 
 enum Frame {

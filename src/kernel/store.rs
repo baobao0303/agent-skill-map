@@ -359,7 +359,7 @@ pub fn persist(
                 l.trigger.as_ref().map(|t| &t.normalized_trigger),
                 l.location.as_ref().map(|x| x.line),
                 l.location.as_ref().map(|x| x.offset),
-                json(&l.occurrences),
+                (!l.occurrences.is_empty()).then(|| json(&l.occurrences)),
                 l.resolved_target,
                 l.raw,
             ])?;
@@ -414,7 +414,7 @@ pub fn persist(
     sweep_per_tuple_contributions(&tx, contributions, freshly_run_tuples)?;
     upsert_contributions_buffer(&tx, contributions)?;
     replace_all_scan_contribution_errors(&tx, contribution_errors)?;
-    upsert_node_enrichments(&tx, enrichments, scan.scanned_at)?;
+    upsert_node_enrichments(&tx, enrichments, &scan.nodes, scan.scanned_at)?;
     tx.commit()
 }
 
@@ -540,20 +540,23 @@ fn replace_all_scan_contribution_errors(tx: &Connection, errors: &[ContributionE
     Ok(())
 }
 
-fn upsert_node_enrichments(tx: &Connection, enrichments: &[(String, String, Value)], now: i64) -> rusqlite::Result<()> {
+fn upsert_node_enrichments(tx: &Connection, enrichments: &[(String, String, Value)], nodes: &[Node], now: i64) -> rusqlite::Result<()> {
     if enrichments.is_empty() {
         return Ok(());
     }
+    let body_hashes: std::collections::HashMap<&str, &str> = nodes.iter().map(|n| (n.path.as_str(), n.body_hash.as_str())).collect();
     let mut stmt = tx.prepare(
         "INSERT INTO node_enrichments (node_path, extractor_id, body_hash_at_enrichment, value_json, stale, enriched_at, is_probabilistic)
-         VALUES (?1, ?2, '', ?3, 0, ?4, 0)
+         VALUES (?1, ?2, ?3, ?4, 0, ?5, 0)
          ON CONFLICT(node_path, extractor_id) DO UPDATE SET
+           body_hash_at_enrichment = excluded.body_hash_at_enrichment,
            value_json = excluded.value_json,
            stale = 0,
            enriched_at = excluded.enriched_at",
     )?;
     for (node_path, extractor_id, val) in enrichments {
-        stmt.execute(params![node_path, extractor_id, json(val), now])?;
+        let body_hash = body_hashes.get(node_path.as_str()).copied().unwrap_or("");
+        stmt.execute(params![node_path, extractor_id, body_hash, json(val), now])?;
     }
     Ok(())
 }
@@ -654,8 +657,8 @@ pub fn load(conn: &Connection) -> rusqlite::Result<Option<ScanResult>> {
                     v.into_iter()
                         .map(|e| ExternalRef {
                             url: e["url"].as_str().unwrap_or("").into(),
-                            line: e["line"].as_u64().unwrap_or(0),
-                            original_trigger: e["originalTrigger"].as_str().unwrap_or("").into(),
+                            line: e["line"].as_u64(),
+                            original_trigger: e["originalTrigger"].as_str().map(String::from),
                         })
                         .collect()
                 }),

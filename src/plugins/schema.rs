@@ -17,6 +17,7 @@ fn registry() -> &'static HashMap<String, Value> {
         let raw: &[&str] = &[
             include_str!("../schema/spec/schemas/view-slots.schema.json"),
             include_str!("../schema/spec/schemas/input-types.schema.json"),
+            include_str!("../schema/spec/schemas/link.schema.json"),
             include_str!("../schema/spec/schemas/extensions/base.schema.json"),
             include_str!("../schema/spec/schemas/extensions/analyzer.schema.json"),
             include_str!("../schema/spec/schemas/extensions/extractor.schema.json"),

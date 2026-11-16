@@ -12,24 +12,23 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
+/// `wrapText`: whitespace-split words, greedily joined by one space up to `width`.
 fn wrap_text(s: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
-    for paragraph in s.split('\n') {
-        let mut cur = String::new();
-        for word in paragraph.split_whitespace() {
-            if cur.is_empty() {
-                cur.push_str(word);
-            } else if cur.len() + 1 + word.len() <= width {
-                cur.push(' ');
-                cur.push_str(word);
-            } else {
-                lines.push(cur);
-                cur = word.to_string();
-            }
+    let mut current = String::new();
+    for word in s.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.chars().count() + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        } else {
+            current.push(' ');
+            current.push_str(word);
         }
-        if !cur.is_empty() {
-            lines.push(cur);
-        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
     }
     lines
 }
@@ -525,26 +524,44 @@ pub fn run(cli: &Cli, scope: &Scope, args: &PluginsArgs) -> Result<u8, CliError>
             let (built_ins, drop_ins) = discover_plugins(scope);
             let elapsed_ms = started.elapsed().as_millis() as u64;
 
-            let mut enabled_count = 0;
-            let mut disabled_count = 0;
-            let mut issues = Vec::new();
-            let mut invalid_count = 0;
-
-            for p in built_ins.iter().chain(drop_ins.iter()) {
+            // countByStatus: built-in extensions by their flag; a user plugin
+            // counts once under its status, or its extensions when enabled.
+            const STATUS_ORDER: [&str; 7] =
+                ["enabled", "disabled", "incompatible-spec", "incompatible-catalog", "invalid-manifest", "load-error", "id-collision"];
+            let mut status_counts = [0usize; 7];
+            for p in &built_ins {
                 for ext in &p.extensions {
-                    if ext["enabled"].as_bool().unwrap_or(false) {
-                        enabled_count += 1;
-                    } else {
-                        disabled_count += 1;
+                    status_counts[if ext["enabled"].as_bool().unwrap_or(false) { 0 } else { 1 }] += 1;
+                }
+            }
+            let mut bad: Vec<&DiscoveredPlugin> = Vec::new();
+            let mut invalid_count = 0;
+            let mut issues = Vec::new();
+            for p in &drop_ins {
+                // sm lists an untrusted plugin as enabled with every extension unloaded.
+                if p.status == "untrusted" {
+                    status_counts[1] += p.extensions.len() + p.unloaded_extensions.len();
+                    continue;
+                }
+                if p.status != "enabled" && p.status != "disabled" {
+                    bad.push(p);
+                }
+                if let Some(i) = STATUS_ORDER.iter().position(|s| *s == p.status) {
+                    if p.status != "enabled" {
+                        status_counts[i] += 1;
                     }
                 }
-                disabled_count += p.unloaded_extensions.len();
-
+                if p.status == "enabled" {
+                    status_counts[0] += p.extensions.len();
+                    status_counts[1] += p.unloaded_extensions.len();
+                }
                 for iss in &p.issues {
                     issues.push(iss.clone());
                     invalid_count += 1;
                 }
             }
+            let enabled_count = status_counts[0];
+            let disabled_count = status_counts[1];
 
             let contrib_errors = if scope.db_path().exists() {
                 if let Ok(conn) = store::open_existing(&scope.db_path()) {
@@ -598,13 +615,35 @@ pub fn run(cli: &Cli, scope: &Scope, args: &PluginsArgs) -> Result<u8, CliError>
             if cli.global.json {
                 println!("{}", serde_json::to_string(&report).unwrap());
             } else {
-                println!("Plugins Doctor:");
-                println!("  Enabled: {enabled_count}");
-                println!("  Disabled: {disabled_count}");
-                println!("  Loaded: {loaded_count}");
+                // #renderHumanReport: summary, source and status tables, issues,
+                // runtime contribution errors (warnings are not computed here).
+                let plural = |n: usize| if n == 1 { "" } else { "s" };
+                println!(
+                    "plugins doctor: {enabled_count} enabled extension{} \u{b7} {} issue{} \u{b7} 0 warnings\n",
+                    plural(enabled_count),
+                    bad.len(),
+                    plural(bad.len())
+                );
+                println!("  Source");
+                println!("    {:<8}  {}", "built-in", built_ins.len());
+                println!("    {:<8}  {}", "user", drop_ins.len());
+                let width = STATUS_ORDER.iter().map(|s| s.len()).max().unwrap_or(0);
+                println!("\n  Status");
+                for (label, n) in STATUS_ORDER.iter().zip(status_counts) {
+                    println!("    {label:<width$}  {n}");
+                }
+                if !bad.is_empty() {
+                    println!("\n  Issues ({})", bad.len());
+                    for p in &bad {
+                        println!("    \u{2715}  {}  {}", p.id, p.status);
+                        for line in wrap_text(p.reason.as_deref().unwrap_or(""), 64) {
+                            println!("       {line}");
+                        }
+                    }
+                }
                 if !contrib_errors.is_empty() {
                     let total = contrib_errors.len();
-                    print!("\n  Runtime contribution errors (last scan) ({total})\n");
+                    println!("\n  Runtime contribution errors (last scan) ({total})");
                     let mut by_plugin: Vec<(String, Vec<&ContributionError>)> = Vec::new();
                     for err in &contrib_errors {
                         if let Some((_, list)) = by_plugin.iter_mut().find(|(pid, _)| pid == &err.plugin_id) {
@@ -615,20 +654,20 @@ pub fn run(cli: &Cli, scope: &Scope, args: &PluginsArgs) -> Result<u8, CliError>
                     }
                     for (pid, list) in by_plugin {
                         let count = list.len();
-                        print!("    ✕  {pid}  ({count})\n");
+                        println!("    \u{2715}  {pid}  ({count})");
                         for err in list.iter().take(3) {
                             for line in wrap_text(&err.message, 64) {
-                                print!("       {line}\n");
+                                println!("       {line}");
                             }
                         }
                         if count > 3 {
                             let hidden = count - 3;
-                            print!("       ... and {hidden} more\n");
+                            println!("       ... and {hidden} more");
                         }
                     }
                 }
             }
-            if issues.is_empty() && contrib_errors.is_empty() {
+            if bad.is_empty() && contrib_errors.is_empty() {
                 Ok(0)
             } else {
                 Ok(1)
