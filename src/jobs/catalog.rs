@@ -66,12 +66,17 @@ fn enabled_by_default(e: &Value) -> bool {
 }
 
 fn drop_ins(scope: &Scope) -> Vec<Ext> {
+    scope.warn_if_untrusted_plugins();
     let mut out = Vec::new();
     let Ok(plugins) = std::fs::read_dir(scope.dir().join("plugins")) else { return out };
     let mut plugins: Vec<_> = plugins.filter_map(Result::ok).filter(|e| e.path().join("plugin.json").is_file()).collect();
     plugins.sort_by_key(|e| e.file_name());
+    let trusted = scope.load_plugin_trust();
     for p in plugins {
         let plugin = p.file_name().to_string_lossy().to_string();
+        if !trusted.contains(&plugin) {
+            continue;
+        }
         for (folder, kind) in [("actions", "action"), ("analyzers", "analyzer")] {
             let Ok(exts) = std::fs::read_dir(p.path().join(folder)) else { continue };
             let mut exts: Vec<_> = exts.filter_map(Result::ok).filter(|e| e.path().is_dir()).collect();

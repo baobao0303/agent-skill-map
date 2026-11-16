@@ -4,15 +4,16 @@
 //! analyzers run in registration order; their issues are emitted in
 //! registration order overall.
 //!
-//! Not ported: `schema-violation` re-validates the pipeline's own nodes and
-//! links against node/link schemas, which the typed model here guarantees;
-//! `observed-*` need the session journal (phase 6); `issue-counter`,
-//! `link-counter` and `annotation-stale` only emit UI contributions.
+//! `schema-violation` checks links against `link.schema.json` (nodes are not
+//! re-validated: the typed model here guarantees their shape). Not ported:
+//! `observed-*` need the session journal (phase 6); `link-counter` and
+//! `annotation-stale` only emit UI contributions.
 
 use crate::extract::Signal;
 use crate::format::locale_compare;
 use crate::model::{Issue, Link, Node};
 use crate::norm::normalize_trigger;
+use crate::plugins::schema::{format_errors, validate};
 use crate::provider::{self, Identifier};
 use crate::resolve::Rejection;
 use serde_json::{Value, json};
@@ -28,18 +29,35 @@ pub struct Ctx<'a> {
     pub orphan_sidecars: &'a [String],
     /// `core/reference-broken` setting `ignored-references`: (type, value).
     pub ignored_references: &'a [(String, String)],
+    /// Score-phase confidence ops from plugin analyzers, per link index:
+    /// (pluginId, extensionId, op kind, value).
+    pub plugin_ops: &'a [Vec<(String, String, String, f64)>],
 }
 
 const RESERVED_PENALTY: f64 = 0.9;
 const BROKEN_PENALTY: f64 = 0.75;
 
-pub fn run(ctx: Ctx) -> Vec<Issue> {
+/// Returns the (score-phase, detect-phase) issues, operator dismissals
+/// already applied.
+pub fn run(ctx: Ctx) -> (Vec<Issue>, Vec<Issue>) {
     // score phase: compute, then fold before any detect analyzer reads links.
     let mut deltas = vec![0.0f64; ctx.links.len()];
     let reserved = name_reserved(&ctx, &mut deltas);
     let broken = reference_broken(&ctx, &mut deltas);
-    for (link, delta) in ctx.links.iter_mut().zip(deltas) {
-        link.confidence = (link.confidence + delta).clamp(0.0, 1.0);
+    // Every score op (built-in deltas and plugin ops) folds in one pass,
+    // ordered by (pluginId, extensionId), like `applyConfidenceAdjustments`.
+    for (i, (link, delta)) in ctx.links.iter_mut().zip(deltas).enumerate() {
+        match ctx.plugin_ops.get(i).filter(|o| !o.is_empty()) {
+            None => link.confidence = (link.confidence + delta).clamp(0.0, 1.0),
+            Some(ops) => {
+                let mut all = ops.clone();
+                if delta != 0.0 {
+                    all.push(("core".into(), String::new(), "delta".into(), delta));
+                }
+                all.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+                link.confidence = crate::plugins::runtime::fold_confidence(link.confidence, &all);
+            }
+        }
     }
     let ctx = &ctx;
     // registration order (alphabetical by id)
@@ -55,20 +73,34 @@ pub fn run(ctx: Ctx) -> Vec<Issue> {
     issues.extend(node_stability(ctx));
     issues.extend(broken);
     issues.extend(reference_redundant(ctx));
+    issues.extend(schema_violation(ctx));
     // The original sorts analyzers by phase before running them, so score
     // issues come first.
     let (score, detect): (Vec<Issue>, Vec<Issue>) =
         issues.into_iter().partition(|i| i.analyzer_id == "name-reserved" || i.analyzer_id == "reference-broken");
     // Operator dismissals apply to every analyzer: an issue whose
     // `data.target` matches an issueSuppressions entry of one of its nodes.
-    score
-        .into_iter()
-        .chain(detect)
-        .filter(|i| {
-            let Some(target) = i.get("data").and_then(|d| d.get("target")).and_then(Value::as_str) else { return true };
-            !i.node_ids.iter().any(|n| is_suppressed(ctx, n, &i.analyzer_id, target))
+    let keep = |i: &Issue| {
+        let Some(target) = i.get("data").and_then(|d| d.get("target")).and_then(Value::as_str) else { return true };
+        !i.node_ids.iter().any(|n| is_suppressed(ctx, n, &i.analyzer_id, target))
+    };
+    (score.into_iter().filter(keep).collect(), detect.into_iter().filter(keep).collect())
+}
+
+/// `isDismissedByOperator` for a plugin analyzer's issue: an
+/// issueSuppressions entry naming the qualified id (or its bare id) and the
+/// issue's `data.target`.
+pub fn plugin_issue_suppressed(nodes: &[Node], qualified: &str, issue: &Issue) -> bool {
+    let Some(target) = issue.get("data").and_then(|d| d.get("target")).and_then(Value::as_str) else { return false };
+    let bare = qualified.rsplit('/').next().unwrap_or(qualified);
+    issue.node_ids.iter().any(|path| {
+        let Some(node) = nodes.iter().find(|n| &n.path == path) else { return false };
+        let entries = node.sidecar.as_ref().and_then(|s| s.get("annotations")).and_then(|a| a.get("issueSuppressions")).and_then(Value::as_array);
+        entries.into_iter().flatten().any(|e| {
+            let a = e.get("analyzer").and_then(Value::as_str).unwrap_or("");
+            e.get("value").and_then(Value::as_str) == Some(target) && (a == qualified || a == bare)
         })
-        .collect()
+    })
 }
 
 /// `formatFinding`: optional `` `subject`:\n`` head, optional `L<n>, …: ` prefix.
@@ -577,4 +609,36 @@ fn reference_redundant(ctx: &Ctx) -> Vec<Issue> {
         );
     }
     issues
+}
+
+const LINK_SCHEMA: &str = "https://skill-map.ai/spec/v1/link.schema.json";
+
+/// `core/schema-violation` for links: the record `toLinkForSchema` builds
+/// (no occurrences, no resolved target), checked against `link.schema.json`.
+fn schema_violation(ctx: &Ctx) -> Vec<Issue> {
+    ctx.links
+        .iter()
+        .filter_map(|l| {
+            let record = json!({
+                "source": l.source,
+                "target": l.target,
+                "kind": l.kind,
+                "confidence": l.confidence,
+                "sources": l.sources,
+                "trigger": l.trigger.as_ref().map(|t| json!({ "originalTrigger": t.original_trigger, "normalizedTrigger": t.normalized_trigger })),
+                "location": l.location.as_ref().map(|x| json!({ "line": x.line, "offset": x.offset })),
+                "raw": l.raw,
+            });
+            let errors = validate(LINK_SCHEMA, &record);
+            if errors.is_empty() {
+                return None;
+            }
+            let body = format!("Link failed schema validation; {}", format_errors(&errors));
+            Some(
+                Issue::new("schema-violation", "error", vec![l.source.clone()], format_finding(Some(&l.target), &[], &body))
+                    .fix("Correct the fields the message lists so the record satisfies its schema; the error names each offending path.")
+                    .data(json!({ "target": "link", "source": l.source, "to": l.target })),
+            )
+        })
+        .collect()
 }

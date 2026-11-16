@@ -1,7 +1,10 @@
 //! One scan: walk → classify → extract → resolve → analyze (spec_doc §8).
 
 use crate::extract::{self, NodeInput};
-use crate::model::{ExternalRef, Issue, Link, Node, OversizedFile, ScanResult, ScannedBy, Stats, Triple};
+use crate::model::{
+    Contribution, ContributionError, ExternalRef, Issue, Link, Node, OversizedFile, ScanResult, ScannedBy,
+    Stats, Triple,
+};
 use crate::provider::{self, McpDialect, PROVIDERS, Parser};
 use crate::walk::{self, IgnoreLayers, WalkOpts};
 use crate::{analyze, canon_yaml, diagnose, frontmatter, resolve, tokens, validate};
@@ -27,6 +30,8 @@ pub struct ScanOpts {
     pub changed: Option<ChangedPaths>,
     /// `plugins.core.extensions.reference-broken.settings.ignored-references`.
     pub ignored_references: Vec<(String, String)>,
+    /// Plain-text scans announce the project-local plugins they load on stderr.
+    pub announce_plugins: bool,
 }
 
 #[derive(Default, Clone)]
@@ -60,13 +65,18 @@ pub struct Outcome {
     pub result: ScanResult,
     pub renames: Vec<Rename>,
     pub extractor_runs: Vec<ExtractorRun>,
+    pub contributions: Vec<Contribution>,
+    pub contribution_errors: Vec<ContributionError>,
+    pub registered_contribution_keys: HashSet<String>,
+    pub freshly_run_tuples: HashSet<String>,
+    pub enrichments: Vec<(String, String, Value)>,
 }
 
 /// One `scan_extractor_runs` row: the cache key an extractor ran under.
 #[derive(Clone)]
 pub struct ExtractorRun {
     pub node_path: String,
-    pub extractor_id: &'static str,
+    pub extractor_id: String,
     pub body_hash: String,
     pub sidecar_annotations_hash: String,
     pub settings_hash: String,
@@ -119,9 +129,59 @@ pub fn ignore_matcher(opts: &ScanOpts) -> ignore::gitignore::Gitignore {
 }
 
 /// sha256 of the canonical YAML of an extractor's resolved settings.
-fn settings_hash(extractor: &str) -> String {
-    let settings = if extractor == "core/external-url-counter" { json!({ "ignored-domains": [] }) } else { json!({}) };
+/// `core_settings`: the resolved settings of `core/external-url-counter`;
+/// every other built-in extractor has none.
+fn settings_hash(extractor: &str, core_settings: &Value) -> String {
+    let settings = if extractor == "core/external-url-counter" { core_settings.clone() } else { json!({}) };
     sha256_hex(&canon_yaml::dump(&settings))
+}
+
+/// `readIgnoredDomains`: the lowercased, non-empty `ignored-domains` entries.
+fn ignored_domains(core_settings: &Value) -> HashSet<String> {
+    core_settings
+        .get("ignored-domains")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).filter(|s| !s.is_empty()).map(str::to_lowercase).collect())
+        .unwrap_or_default()
+}
+
+/// Short ids (the `sources` a link records) of the extractors that apply to
+/// a node: the built-in ones of the lens and the plugin ones of its kind and provider.
+fn live_sources(lens: &str, node: &Node, plugin_rt: &crate::plugins::runtime::Runtime) -> HashSet<String> {
+    let builtin = applicable_extractors(lens, &node.kind).into_iter().map(|id| id.rsplit('/').next().unwrap_or(id).to_string());
+    let plugins = plugin_rt
+        .extractors
+        .iter()
+        .filter(|ex| ex.matches_kind(&node.kind) && ex.matches_provider(&node.provider))
+        .map(|ex| ex.id.clone());
+    builtin.chain(plugins).collect()
+}
+
+/// `reuseCachedLink` on a cache hit: a prior link keeps the sources that still
+/// name an applicable extractor; a link left with none (or with none recorded) is dropped.
+fn reuse_prior_link(link: &Link, live: &HashSet<String>) -> Option<Link> {
+    let kept: Vec<String> = link.sources.iter().filter(|s| live.contains(s.as_str())).cloned().collect();
+    if kept.is_empty() {
+        return None;
+    }
+    if kept.len() == link.sources.len() {
+        return Some(link.clone());
+    }
+    Some(Link { sources: kept, ..link.clone() })
+}
+
+fn overlay_has_version(sidecar: &Value) -> bool {
+    sidecar
+        .get("annotations")
+        .and_then(|a| a.get("version"))
+        .map_or(false, |v| v.is_number())
+}
+
+fn refuses_as_fresh(sidecar: Option<&Value>) -> bool {
+    let Some(s) = sidecar else { return false; };
+    s.get("present") == Some(&Value::Bool(true))
+        && s.get("status").and_then(|st| st.as_str()) == Some("fresh")
+        && overlay_has_version(s)
 }
 
 fn sidecar_annotations_hash(node: &Node) -> String {
@@ -155,8 +215,14 @@ pub fn run_incremental(opts: &ScanOpts, prior: Option<&ScanResult>, prior_runs: 
         .filter_map(|(k, n)| Some((*k, (n.body_hash.as_str(), n.frontmatter_hash.as_str(), n.tokens?))))
         .collect();
     let root = &opts.root;
-    validate_plugins_manifests(root);
+    let mut plugin_rt = crate::plugins::runtime::load(root);
+    if opts.announce_plugins && !plugin_rt.executed.is_empty() {
+        let ids: Vec<String> = plugin_rt.executed.iter().map(|id| crate::cli::format::sanitize(id)).collect();
+        let n = ids.len();
+        eprintln!("\u{2139}  Loaded {n} project-local plugin{}: {}", if n == 1 { "" } else { "s" }, ids.join(", "));
+    }
     let ignore = ignore_matcher(opts);
+    let core_settings = crate::plugins::runtime::resolve_builtin_settings(&crate::scope::Scope::new(root.to_path_buf()), "core", "external-url-counter");
 
     let mut nodes: Vec<Node> = Vec::new();
     let mut bodies: Vec<(String, usize)> = Vec::new(); // per real node: body, body_line_offset
@@ -265,6 +331,11 @@ pub fn run_incremental(opts: &ScanOpts, prior: Option<&ScanResult>, prior_runs: 
         node.sidecar = Some(overlay);
         let sidecar_hash = sidecar_annotations_hash(node);
         let applicable = applicable_extractors(&opts.lens, &node.kind);
+        let applicable_plugins: Vec<&crate::plugins::runtime::Extractor> = plugin_rt
+            .extractors
+            .iter()
+            .filter(|ex| ex.matches_kind(&node.kind) && ex.matches_provider(&node.provider))
+            .collect();
         let hit = cache_on
             && prior_nodes.get(node.path.as_str()).is_some_and(|p| {
                 (!opts.tokenize || p.tokens.is_some())
@@ -274,7 +345,13 @@ pub fn run_incremental(opts: &ScanOpts, prior: Option<&ScanResult>, prior_runs: 
                         let for_node = runs.get(&node.path);
                         applicable.iter().all(|id| {
                             for_node.and_then(|m| m.get(*id)).is_some_and(|(b, sc, st)| {
-                                *b == node.body_hash && *sc == sidecar_hash && *st == settings_hash(id)
+                                *b == node.body_hash && *sc == sidecar_hash && *st == settings_hash(id, &core_settings)
+                            })
+                        }) && applicable_plugins.iter().all(|ex| {
+                            let q = ex.qualified();
+                            let st_hash = sha256_hex(&canon_yaml::dump(&ex.resolved_settings));
+                            for_node.and_then(|m| m.get(&q)).is_some_and(|(b, sc, st)| {
+                                *b == node.body_hash && *sc == sidecar_hash && *st == st_hash
                             })
                         })
                     })
@@ -294,14 +371,26 @@ pub fn run_incremental(opts: &ScanOpts, prior: Option<&ScanResult>, prior_runs: 
             cached_paths.insert(node.path.clone());
         }
         issues.extend(issue);
-        extractor_runs.extend(applicable.into_iter().map(|id| ExtractorRun {
-            node_path: node.path.clone(),
-            extractor_id: id,
-            body_hash: node.body_hash.clone(),
-            sidecar_annotations_hash: sidecar_hash.clone(),
-            settings_hash: settings_hash(id),
-            ran_at,
-        }));
+        for id in applicable {
+            extractor_runs.push(ExtractorRun {
+                node_path: node.path.clone(),
+                extractor_id: id.to_string(),
+                body_hash: node.body_hash.clone(),
+                sidecar_annotations_hash: sidecar_hash.clone(),
+                settings_hash: settings_hash(id, &core_settings),
+                ran_at,
+            });
+        }
+        for ex in applicable_plugins {
+            extractor_runs.push(ExtractorRun {
+                node_path: node.path.clone(),
+                extractor_id: ex.qualified(),
+                body_hash: node.body_hash.clone(),
+                sidecar_annotations_hash: sidecar_hash.clone(),
+                settings_hash: sha256_hex(&canon_yaml::dump(&ex.resolved_settings)),
+                ran_at,
+            });
+        }
     }
     let kernel_issues: Vec<Issue> = node_issues.into_iter().flatten().collect();
 
@@ -323,6 +412,51 @@ pub fn run_incremental(opts: &ScanOpts, prior: Option<&ScanResult>, prior_runs: 
             extract::run(&input, &opts.lens)
         })
         .collect();
+
+    let mut freshly_run_tuples: HashSet<String> = HashSet::new();
+    let mut all_enrichments: Vec<(String, String, Value)> = Vec::new();
+    let mut all_contributions: Vec<Contribution> = Vec::new();
+    let mut all_contribution_errors: Vec<ContributionError> = Vec::new();
+    let mut plugin_links: HashMap<String, Vec<Link>> = HashMap::new();
+    let mut plugin_extractor_contribs: HashMap<String, Vec<Contribution>> = HashMap::new();
+
+    for (n, (body, _)) in nodes.iter().zip(bodies.iter()) {
+        if cached_paths.contains(&n.path) {
+            continue;
+        }
+        for id in applicable_extractors(&opts.lens, &n.kind) {
+            let slash = id.find('/').unwrap_or(0);
+            let (plugin, ext) = (&id[..slash], &id[slash + 1..]);
+            freshly_run_tuples.insert(format!("{plugin}\0{ext}\0{}", n.path));
+        }
+
+        let applicable_indices: Vec<usize> = plugin_rt
+            .extractors
+            .iter()
+            .enumerate()
+            .filter(|(_, ex)| ex.matches_kind(&n.kind) && ex.matches_provider(&n.provider))
+            .map(|(i, _)| i)
+            .collect();
+        for idx in applicable_indices {
+            let (plugin_id, id) = {
+                let ex = &plugin_rt.extractors[idx];
+                (ex.plugin_id.clone(), ex.id.clone())
+            };
+            let out = plugin_rt.run_extractor_idx(
+                idx,
+                n,
+                body,
+                n.frontmatter.as_ref().unwrap_or(&Value::Null),
+            );
+            plugin_links.entry(n.path.clone()).or_default().extend(out.links);
+            for (extractor_qualified, val) in out.enrichments {
+                all_enrichments.push((n.path.clone(), extractor_qualified, val));
+            }
+            plugin_extractor_contribs.entry(n.path.clone()).or_default().extend(out.contributions);
+            all_contribution_errors.extend(out.contribution_errors);
+            freshly_run_tuples.insert(format!("{}\0{}\0{}", plugin_id, id, n.path));
+        }
+    }
     let mut signals = Vec::new();
     let mut with_virtual: Vec<Node> = Vec::with_capacity(nodes.len());
     for (node, out) in nodes.into_iter().zip(outputs) {
@@ -336,9 +470,7 @@ pub fn run_incremental(opts: &ScanOpts, prior: Option<&ScanResult>, prior_runs: 
         }
     }
     let mut nodes = with_virtual;
-    // Cache hits: carry their prior virtual nodes, and their prior links
-    // (ahead of the freshly resolved ones, in node order).
-    let mut reused_links: Vec<Link> = Vec::new();
+    // Cache hits: carry their prior virtual nodes.
     if let Some(p) = prior.filter(|_| !cached_paths.is_empty()) {
         for n in &p.nodes {
             let keep = n.r#virtual == Some(true)
@@ -348,17 +480,45 @@ pub fn run_incremental(opts: &ScanOpts, prior: Option<&ScanResult>, prior_runs: 
                 nodes.push(n.clone());
             }
         }
-        for n in nodes.iter().filter(|n| cached_paths.contains(&n.path)) {
-            reused_links.extend(p.links.iter().filter(|l| l.source == n.path && !l.sources.is_empty()).cloned());
-        }
     }
     apply_config_mcp_nodes(root, &opts.lens, &mut nodes);
 
+    // Links in orchestrator order: node by node, a cache hit contributing its
+    // prior links and a fresh node its plugin `emitLink` links; the resolved
+    // signal links come after all of them. A plugin link to an external URL
+    // is an external ref, not a stored link, and precedes the signal externals.
+    let mut node_links: Vec<Link> = Vec::new();
+    let mut external: Vec<Link> = Vec::new();
+    for n in &nodes {
+        if cached_paths.contains(&n.path) {
+            if let Some(p) = prior {
+                let live = live_sources(&opts.lens, n, &plugin_rt);
+                node_links.extend(p.links.iter().filter(|l| l.source == n.path).filter_map(|l| reuse_prior_link(l, &live)));
+            }
+        } else if let Some(links) = plugin_links.remove(&n.path) {
+            let (ext, int): (Vec<Link>, Vec<Link>) = links.into_iter().partition(|l| resolve::is_external_url(&l.target));
+            external.extend(ext);
+            node_links.extend(int);
+        }
+    }
+
     let (resolved, rejections) = resolve::resolve_signals(&signals);
-    let (external, mut internal): (Vec<Link>, Vec<Link>) =
+    let (signal_external, mut internal): (Vec<Link>, Vec<Link>) =
         resolved.into_iter().partition(|l| resolve::is_external_url(&l.target));
-    reused_links.append(&mut internal);
-    let internal = reused_links;
+    // `ignored-domains`: a URL whose hostname is listed is never emitted.
+    let ignored = ignored_domains(&core_settings);
+    let signal_external: Vec<Link> = signal_external
+        .into_iter()
+        .filter(|l| !url::Url::parse(&l.target).ok().and_then(|u| u.host_str().map(str::to_owned)).is_some_and(|h| ignored.contains(&h)))
+        .collect();
+    // The core counter's count: body URLs per node (plugin externals excluded).
+    let mut core_external_counts: HashMap<String, u64> = HashMap::new();
+    for l in &signal_external {
+        *core_external_counts.entry(l.source.clone()).or_default() += 1;
+    }
+    external.extend(signal_external);
+    node_links.append(&mut internal);
+    let internal = node_links;
     let reserved = resolve::reserved_node_paths(&nodes);
     let mut links = resolve::dedupe_links(internal);
     let idx = resolve::build_indexes(&nodes);
@@ -369,7 +529,17 @@ pub fn run_incremental(opts: &ScanOpts, prior: Option<&ScanResult>, prior_runs: 
 
     let mut issues = kernel_issues;
     let orphans = orphan_sidecars(root, Some(&ignore));
-    issues.extend(analyze::run(analyze::Ctx {
+    // Project-local plugin analyzers run with the built-ins, ordered by
+    // phase: score ops fold together before any detect analyzer reads
+    // links, then detect, then aggregate.
+    let plugin_score = if plugin_rt.is_empty() {
+        Default::default()
+    } else {
+        plugin_rt.run_phase(&["score"], &nodes, &links, root)
+    };
+    all_contribution_errors.extend(plugin_score.contribution_errors);
+
+    let (score_issues, detect_issues) = analyze::run(analyze::Ctx {
         nodes: &nodes,
         links: &mut links,
         reserved_paths: &reserved,
@@ -378,35 +548,318 @@ pub fn run_incremental(opts: &ScanOpts, prior: Option<&ScanResult>, prior_runs: 
         rejections: &rejections,
         orphan_sidecars: &orphans,
         ignored_references: &opts.ignored_references,
-    }));
+        plugin_ops: &plugin_score.ops,
+    });
+    let plugin_detect = if plugin_rt.is_empty() {
+        Default::default()
+    } else {
+        plugin_rt.run_phase(&["detect"], &nodes, &links, root)
+    };
+    let plugin_aggregate = if plugin_rt.is_empty() {
+        Default::default()
+    } else {
+        plugin_rt.run_phase(&["aggregate"], &nodes, &links, root)
+    };
+    all_contribution_errors.extend(plugin_detect.contribution_errors);
+    all_contribution_errors.extend(plugin_aggregate.contribution_errors);
 
-    // Score phase confidence hook
-    let plugins_dir = root.join(".skill-map/plugins");
-    let mut score_phase = false;
-    if plugins_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
-            for ent in entries.flatten() {
-                let analyzers_dir = ent.path().join("analyzers");
-                if analyzers_dir.is_dir() {
-                    if let Ok(a_entries) = std::fs::read_dir(analyzers_dir) {
-                        for a_ent in a_entries.flatten() {
-                            let js_file = a_ent.path().join("index.js");
-                            if let Ok(txt) = std::fs::read_to_string(js_file) {
-                                if txt.contains("phase: 'score'") || txt.contains("phase: \"score\"") {
-                                    score_phase = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
+    let plugin_issues = |issues: Vec<(String, Issue)>| {
+        issues.into_iter().filter(|(q, i)| !analyze::plugin_issue_suppressed(&nodes, q, i)).map(|(_, i)| i).collect::<Vec<_>>()
+    };
+    issues.extend(score_issues);
+    issues.extend(plugin_issues(plugin_score.issues));
+    issues.extend(detect_issues);
+    issues.extend(plugin_issues(plugin_detect.issues));
+    issues.extend(plugin_issues(plugin_aggregate.issues));
+
+    for a in &plugin_rt.analyzers {
+        if !a.contributions.is_empty() {
+            for n in &nodes {
+                freshly_run_tuples.insert(format!("{}\0{}\0{}", a.plugin_id, a.id, n.path));
             }
         }
     }
-    if score_phase {
-        for link in links.iter_mut() {
-            link.confidence = (link.confidence - 0.4_f64).max(0.5);
+
+    let mut registered_keys = plugin_rt.registered_contribution_keys.clone();
+    drop(plugin_rt);
+
+    let scope = crate::scope::Scope::new(root.to_path_buf());
+    let allow_bump = crate::bump::extension_enabled(&scope, "core", "node-bump", false) && scope.sidecar_writers_allowed();
+    let builtin_registered_keys = [
+        "claude/tools-counter/count",
+        "core/external-url-counter/count",
+        "core/annotation-stale/staleBadge",
+        "core/annotation-stale/staleIcon",
+        "core/issue-counter/warnCount",
+        "core/issue-counter/errorCount",
+        "core/link-counter/linksIn",
+        "core/link-counter/linksOut",
+        "core/node-stability/experimental",
+        "core/node-stability/deprecated",
+        "core/ai-summarizer-action/summarySurface",
+        "core/ai-tagger-action/autoTagSurface",
+        "core/node-set-tags/editTagsButton",
+    ];
+    for k in builtin_registered_keys {
+        registered_keys.insert(k.to_string());
+    }
+    if allow_bump {
+        registered_keys.insert("core/node-bump/bumpButton".to_string());
+    }
+
+    // Contributions in skill-map's array order: extractors (per fresh node,
+    // in extractor order), then analyzers by phase (each one over every node),
+    // then actions in registration order. Plugin analyzers and actions follow
+    // the built-ins of their phase.
+    let mut issue_rows: Vec<Contribution> = Vec::new();
+    for (tier, severity, ext_id) in [("error", "danger", "errorCount"), ("warn", "warn", "warnCount")] {
+        let mut order: Vec<&str> = Vec::new();
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for iss in issues.iter().filter(|i| i.severity == tier) {
+            for id in &iss.node_ids {
+                let count = counts.entry(id.as_str()).or_insert_with(|| {
+                    order.push(id.as_str());
+                    0
+                });
+                *count += 1;
+            }
         }
+        for path in order {
+            let count = counts[path];
+            let tooltip = match (tier, count) {
+                ("error", 1) => "1 error".to_string(),
+                ("error", _) => format!("{count} errors"),
+                (_, 1) => "1 warning".to_string(),
+                _ => format!("{count} warnings"),
+            };
+            issue_rows.push(Contribution {
+                plugin_id: "core".to_string(),
+                extension_id: "issue-counter".to_string(),
+                node_path: path.to_string(),
+                contribution_id: ext_id.to_string(),
+                slot: "card.footer.right".to_string(),
+                payload: json!({ "value": count.min(99), "severity": severity, "tooltip": tooltip }),
+                emitted_at: ran_at,
+            });
+        }
+    }
+
+    for node in &nodes {
+        if node.r#virtual == Some(true) {
+            continue;
+        }
+        freshly_run_tuples.insert(format!("core\0ai-summarizer-action\0{}", node.path));
+        freshly_run_tuples.insert(format!("core\0ai-tagger-action\0{}", node.path));
+        freshly_run_tuples.insert(format!("core\0node-set-tags\0{}", node.path));
+        freshly_run_tuples.insert(format!("core\0annotation-stale\0{}", node.path));
+        freshly_run_tuples.insert(format!("core\0issue-counter\0{}", node.path));
+        freshly_run_tuples.insert(format!("core\0link-counter\0{}", node.path));
+        freshly_run_tuples.insert(format!("core\0node-stability\0{}", node.path));
+        if allow_bump {
+            freshly_run_tuples.insert(format!("core\0node-bump\0{}", node.path));
+        }
+    }
+
+    // 1. Extractors: per fresh node, claude's tools-counter, core's
+    // external-url-counter (body URLs only, plugin `emitLink` externals do not
+    // count), then the project plugin extractors' contributions.
+    for node in &nodes {
+        if node.r#virtual == Some(true) || cached_paths.contains(&node.path) {
+            continue;
+        }
+        if node.provider == "claude" && node.kind == "agent" {
+            if let Some(tools) = node.frontmatter.as_ref().and_then(|f| f.get("tools")).and_then(Value::as_array) {
+                let names: Vec<&str> = tools.iter().filter_map(Value::as_str).filter(|s| !s.is_empty()).collect();
+                if !names.is_empty() {
+                    let tooltip = names.join(", ");
+                    all_contributions.push(Contribution {
+                        plugin_id: "claude".to_string(),
+                        extension_id: "tools-counter".to_string(),
+                        node_path: node.path.clone(),
+                        contribution_id: "count".to_string(),
+                        slot: "card.footer.left".to_string(),
+                        payload: json!({ "value": names.len().min(99), "tooltip": tooltip }),
+                        emitted_at: ran_at,
+                    });
+                }
+            }
+        }
+        let count = core_external_counts.get(&node.path).copied().unwrap_or(0);
+        if count > 0 {
+            all_contributions.push(Contribution {
+                plugin_id: "core".to_string(),
+                extension_id: "external-url-counter".to_string(),
+                node_path: node.path.clone(),
+                contribution_id: "count".to_string(),
+                slot: "card.footer.left".to_string(),
+                payload: json!({ "value": count }),
+                emitted_at: ran_at,
+            });
+        }
+        if let Some(rows) = plugin_extractor_contribs.remove(&node.path) {
+            all_contributions.extend(rows);
+        }
+    }
+
+    // 2. Score analyzers (plugins), then detect analyzers: core annotation-stale,
+    // link-counter (in, then out, per node), node-stability, then plugins.
+    all_contributions.extend(plugin_score.contributions);
+    for node in &nodes {
+        if node.r#virtual == Some(true) {
+            continue;
+        }
+        let Some(status) = node.sidecar.as_ref().and_then(|s| s.get("status")).and_then(Value::as_str) else { continue };
+        if !matches!(status, "stale-body" | "stale-frontmatter" | "stale-both") {
+            continue;
+        }
+        let tooltip = match status {
+            "stale-body" => "Sidecar drift since last bump:\n  \u{2022} body\nRun `sm bump <path>` to refresh.",
+            "stale-frontmatter" => "Sidecar drift since last bump:\n  \u{2022} frontmatter\nRun `sm bump <path>` to refresh.",
+            _ => "Sidecar drift since last bump:\n  \u{2022} body\n  \u{2022} frontmatter\nRun `sm bump <path>` to refresh.",
+        };
+        all_contributions.push(Contribution {
+            plugin_id: "core".to_string(),
+            extension_id: "annotation-stale".to_string(),
+            node_path: node.path.clone(),
+            contribution_id: "staleIcon".to_string(),
+            slot: "card.footer.right".to_string(),
+            payload: json!({ "value": 0, "tooltip": tooltip }),
+            emitted_at: ran_at,
+        });
+        all_contributions.push(Contribution {
+            plugin_id: "core".to_string(),
+            extension_id: "annotation-stale".to_string(),
+            node_path: node.path.clone(),
+            contribution_id: "staleBadge".to_string(),
+            slot: "inspector.header.badge".to_string(),
+            payload: json!({ "icon": "pi-clock", "tooltip": tooltip }),
+            emitted_at: ran_at,
+        });
+    }
+    for node in &nodes {
+        if node.r#virtual == Some(true) {
+            continue;
+        }
+        let mut in_kinds: HashMap<String, usize> = HashMap::new();
+        let mut out_kinds: HashMap<String, usize> = HashMap::new();
+        for l in &links {
+            let target = l.resolved_target.as_deref().unwrap_or(&l.target);
+            if l.source == target || l.source == l.target {
+                continue;
+            }
+            if l.source == node.path {
+                *out_kinds.entry(l.kind.to_string()).or_insert(0) += 1;
+            }
+            if target == node.path {
+                *in_kinds.entry(l.kind.to_string()).or_insert(0) += 1;
+            }
+        }
+        for (contribution_id, direction, kinds) in [("linksIn", "in", &in_kinds), ("linksOut", "out", &out_kinds)] {
+            if kinds.is_empty() {
+                continue;
+            }
+            let total: usize = kinds.values().sum();
+            let mut by_kind: Vec<(&String, &usize)> = kinds.iter().collect();
+            by_kind.sort_by_key(|(k, _)| *k);
+            let mut lines = vec![direction.to_string()];
+            for (k, n) in by_kind {
+                lines.push(format!("{k}: {n}"));
+            }
+            all_contributions.push(Contribution {
+                plugin_id: "core".to_string(),
+                extension_id: "link-counter".to_string(),
+                node_path: node.path.clone(),
+                contribution_id: contribution_id.to_string(),
+                slot: "card.footer.left".to_string(),
+                payload: json!({ "value": total.min(99), "tooltip": lines.join("\n") }),
+                emitted_at: ran_at,
+            });
+        }
+    }
+    for node in &nodes {
+        if node.r#virtual == Some(true) {
+            continue;
+        }
+        let stability = node.sidecar.as_ref().and_then(|s| s.get("annotations")).and_then(|a| a.get("stability")).and_then(Value::as_str);
+        if stability == Some("experimental") {
+            all_contributions.push(Contribution {
+                plugin_id: "core".to_string(),
+                extension_id: "node-stability".to_string(),
+                node_path: node.path.clone(),
+                contribution_id: "experimental".to_string(),
+                slot: "card.footer.right".to_string(),
+                payload: json!({ "value": 0, "tooltip": "Experimental: API may change" }),
+                emitted_at: ran_at,
+            });
+        } else if stability == Some("deprecated") {
+            all_contributions.push(Contribution {
+                plugin_id: "core".to_string(),
+                extension_id: "node-stability".to_string(),
+                node_path: node.path.clone(),
+                contribution_id: "deprecated".to_string(),
+                slot: "card.footer.right".to_string(),
+                payload: json!({ "value": 0, "tooltip": "Deprecated: avoid in new code", "severity": "warn" }),
+                emitted_at: ran_at,
+            });
+        }
+    }
+    all_contributions.extend(plugin_detect.contributions);
+
+    // 3. Aggregate analyzers: core issue-counter, then plugins.
+    all_contributions.extend(issue_rows);
+    all_contributions.extend(plugin_aggregate.contributions);
+
+    // 4. Actions, in registration order, each over every node.
+    for node in nodes.iter().filter(|n| n.r#virtual != Some(true)) {
+        all_contributions.push(Contribution {
+            plugin_id: "core".to_string(),
+            extension_id: "ai-summarizer-action".to_string(),
+            node_path: node.path.clone(),
+            contribution_id: "summarySurface".to_string(),
+            slot: "inspector.surface.summary".to_string(),
+            payload: json!({ "actionId": "core/ai-summarizer-action", "label": "Analyze", "icon": "pi-sparkles", "enabled": true }),
+            emitted_at: ran_at,
+        });
+    }
+    for node in nodes.iter().filter(|n| n.r#virtual != Some(true)) {
+        all_contributions.push(Contribution {
+            plugin_id: "core".to_string(),
+            extension_id: "ai-tagger-action".to_string(),
+            node_path: node.path.clone(),
+            contribution_id: "autoTagSurface".to_string(),
+            slot: "inspector.surface.auto-tag".to_string(),
+            payload: json!({ "actionId": "core/ai-tagger-action", "label": "Auto-tag", "icon": "pi-sparkles", "enabled": true }),
+            emitted_at: ran_at,
+        });
+    }
+    if allow_bump {
+        for node in nodes.iter().filter(|n| n.r#virtual != Some(true)) {
+            let enabled = !refuses_as_fresh(node.sidecar.as_ref());
+            let mut payload = json!({ "actionId": "core/node-bump", "label": "Bump", "icon": "pi-arrow-up-right", "enabled": enabled });
+            if !enabled {
+                payload["disabledReason"] = json!("No drift to bump.");
+            }
+            all_contributions.push(Contribution {
+                plugin_id: "core".to_string(),
+                extension_id: "node-bump".to_string(),
+                node_path: node.path.clone(),
+                contribution_id: "bumpButton".to_string(),
+                slot: "inspector.surface.bump".to_string(),
+                payload,
+                emitted_at: ran_at,
+            });
+        }
+    }
+    for node in nodes.iter().filter(|n| n.r#virtual != Some(true)) {
+        all_contributions.push(Contribution {
+            plugin_id: "core".to_string(),
+            extension_id: "node-set-tags".to_string(),
+            node_path: node.path.clone(),
+            contribution_id: "editTagsButton".to_string(),
+            slot: "inspector.surface.tags".to_string(),
+            payload: json!({ "actionId": "core/node-set-tags", "label": "Edit tags", "icon": "pi-tags", "enabled": true }),
+            emitted_at: ran_at,
+        });
     }
 
     let renames = match prior {
@@ -440,7 +893,16 @@ pub fn run_incremental(opts: &ScanOpts, prior: Option<&ScanResult>, prior_runs: 
         issues,
     }
     .with_oversized_count();
-    Outcome { result, renames, extractor_runs }
+    Outcome {
+        result,
+        renames,
+        extractor_runs,
+        contributions: all_contributions,
+        contribution_errors: all_contribution_errors,
+        registered_contribution_keys: registered_keys,
+        freshly_run_tuples,
+        enrichments: all_enrichments,
+    }
 }
 
 /// `renames.ts`: body-hash match → silent high-confidence rename; a unique
@@ -856,67 +1318,6 @@ pub fn orphan_sidecars(root: &Path, ignore: Option<&ignore::gitignore::Gitignore
     out
 }
 
-fn validate_plugins_manifests(root: &Path) {
-    let plugins_dir = root.join(".skill-map/plugins");
-    if !plugins_dir.is_dir() {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(&plugins_dir) else { return; };
-    for ent in entries.flatten() {
-        let path = ent.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let p_name = ent.file_name().to_string_lossy().to_string();
-
-        // 1. Check kinds/
-        let kinds_dir = path.join("kinds");
-        if kinds_dir.is_dir() {
-            if let Ok(k_entries) = std::fs::read_dir(&kinds_dir) {
-                for k_ent in k_entries.flatten() {
-                    let k_name = k_ent.file_name().to_string_lossy().to_string();
-                    let kind_json = k_ent.path().join("kind.json");
-                    if kind_json.is_file() {
-                        if let Ok(txt) = std::fs::read_to_string(&kind_json) {
-                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                                if !v.is_object() || v.get("ui").is_none() {
-                                    eprintln!(
-                                        "plugin {p_name} (invalid-manifest), all extensions skipped: Provider kind `{k_name}` (declared at `providers/{p_name}/index.js`) failed validation in `kinds/{k_name}/kind.json`: (root) must have required property 'ui'; (root) must NOT have additional properties. See https://github.com/crystian/skill-map/blob/main/spec/schemas/extensions/provider-kind.schema.json."
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 2. Check analyzers/
-        let analyzers_dir = path.join("analyzers");
-        if analyzers_dir.is_dir() {
-            if let Ok(a_entries) = std::fs::read_dir(&analyzers_dir) {
-                for a_ent in a_entries.flatten() {
-                    let a_name = a_ent.file_name().to_string_lossy().to_string();
-                    let js_file = a_ent.path().join("index.js");
-                    if let Ok(txt) = std::fs::read_to_string(&js_file) {
-                        if txt.contains("inspector.header.badge.counter") {
-                            eprintln!(
-                                "plugin {p_name} (invalid-manifest), all extensions skipped: analyzers/{a_name}/index.js: /ui/keywords/slot is not a valid value. See https://github.com/crystian/skill-map/blob/main/spec/view-slots.md."
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3. Check payloads-demo
-        if p_name == "payloads-demo" {
-            eprintln!("⚠  Extractor \"payloads-demo/panels\" emitted contribution \"summary\" on notes/example.md; payload failed the \"inspector.body.panel.key-values\" schema: /pairs/0 must have required property 'value'. Contribution dropped.");
-            eprintln!("⚠  Extension \"payloads-demo/panels\" emitted a view contribution on notes/example.md whose object is not one declared in its `ui` map (pass the declared const by reference, do not spread or inline it). Contribution dropped.");
-        }
-    }
-}
-
 fn recompute_counts(nodes: &mut [Node], links: &[Link], external: &[Link], cached: &HashSet<String>) {
     for n in nodes.iter_mut() {
         n.links_out_count = 0;
@@ -936,8 +1337,8 @@ fn recompute_counts(nodes: &mut [Node], links: &[Link], external: &[Link], cache
         n.external_refs_count += 1;
         let r = ExternalRef {
             url: link.target.clone(),
-            line: link.location.as_ref().map_or(1, |l| l.line),
-            original_trigger: link.trigger.as_ref().map_or_else(|| link.raw.clone(), |t| t.original_trigger.clone()),
+            line: link.location.as_ref().map(|l| l.line),
+            original_trigger: link.trigger.as_ref().map(|t| t.original_trigger.clone()).filter(|t| !t.is_empty()),
         };
         n.external_refs.get_or_insert_with(Vec::new).push(r);
     }
@@ -982,6 +1383,7 @@ mod tests {
             follow_external_symlinks: false,
             changed: None,
             ignored_references: Vec::new(),
+            announce_plugins: false,
         };
         // Absolute paths in messages (invalid-sidecar) are recorded as `<ROOT>`.
         let ours_text = crate::jsjson::to_string(&run(&opts)).replace(&opts.root.display().to_string(), "<ROOT>");

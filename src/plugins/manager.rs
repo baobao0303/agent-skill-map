@@ -3,11 +3,35 @@
 use crate::bump::extension_enabled;
 use crate::catalog::BUILT_INS;
 use crate::cli::{Cli, CliError};
+use crate::model::ContributionError;
 use crate::scope::Scope;
+use crate::store;
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::LazyLock;
+
+/// `wrapText`: whitespace-split words, greedily joined by one space up to `width`.
+fn wrap_text(s: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in s.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.chars().count() + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        } else {
+            current.push(' ');
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
 
 pub static VIEW_SLOTS_CATALOG: LazyLock<Value> = LazyLock::new(|| {
     json!([
@@ -99,7 +123,13 @@ pub enum PluginsCommand {
     },
     /// Scaffold a new drop-in plugin under .skill-map/plugins/<id>/.
     Create {
-        id: String,
+        kind: String,
+        #[arg(id = "plugin-id")]
+        plugin_id: String,
+        #[arg(long)]
+        at: Option<PathBuf>,
+        #[arg(long)]
+        force: bool,
     },
     /// Migrate plugin manifests to current spec version.
     Upgrade,
@@ -120,6 +150,8 @@ pub struct DiscoveredPlugin {
     pub unloaded_extensions: Vec<Value>,
     pub manifest_summary: String,
     pub issues: Vec<Value>,
+    pub reason: Option<String>,
+    pub is_user: bool,
 }
 
 fn enabled_by_default(e: &Value) -> bool {
@@ -141,7 +173,7 @@ pub fn discover_plugins(scope: &Scope) -> (Vec<DiscoveredPlugin>, Vec<Discovered
     for p_id in order {
         if let Some(exts) = built_in_map.get(p_id) {
             let mut ext_values = Vec::new();
-            let mut unloaded = Vec::new();
+            let unloaded = Vec::new();
             let mut summaries = Vec::new();
 
             let p_desc = match p_id {
@@ -167,29 +199,20 @@ pub fn discover_plugins(scope: &Scope) -> (Vec<DiscoveredPlugin>, Vec<Discovered
 
                 summaries.push(format!("{kind}:{p_id}/{id}@{version}"));
 
-                if !is_on && matches!(stability, Some("experimental" | "deprecated")) {
-                    unloaded.push(json!({
-                        "id": id,
-                        "kind": kind,
-                        "stability": stability.unwrap_or("experimental"),
-                        "reason": "extension-disabled"
-                    }));
-                } else {
-                    let mut ext_obj = json!({
-                        "id": id,
-                        "kind": kind,
-                        "version": version,
-                        "enabled": is_on,
-                        "description": desc,
-                    });
-                    if let Some(stab) = stability {
-                        ext_obj.as_object_mut().unwrap().insert("stability".into(), json!(stab));
-                    }
-                    if let Some(settings) = e.get("settings") {
-                        ext_obj.as_object_mut().unwrap().insert("settings".into(), settings.clone());
-                    }
-                    ext_values.push(ext_obj);
+                let mut ext_obj = json!({
+                    "id": id,
+                    "kind": kind,
+                    "version": version,
+                    "enabled": is_on,
+                    "description": desc,
+                });
+                if let Some(stab) = stability {
+                    ext_obj.as_object_mut().unwrap().insert("stability".into(), json!(stab));
                 }
+                if let Some(settings) = e.get("settings") {
+                    ext_obj.as_object_mut().unwrap().insert("settings".into(), settings.clone());
+                }
+                ext_values.push(ext_obj);
             }
 
             let plugin_enabled = ext_values.iter().any(|e| e["enabled"].as_bool().unwrap_or(false));
@@ -202,6 +225,8 @@ pub fn discover_plugins(scope: &Scope) -> (Vec<DiscoveredPlugin>, Vec<Discovered
                 unloaded_extensions: unloaded,
                 manifest_summary: summaries.join(", "),
                 issues: Vec::new(),
+                reason: None,
+                is_user: false,
             });
         }
     }
@@ -329,21 +354,30 @@ pub fn discover_plugins(scope: &Scope) -> (Vec<DiscoveredPlugin>, Vec<Discovered
                     }
                 }
 
-                let status = if !issues.is_empty() {
-                    "invalid-manifest".to_string()
+                let is_trusted = scope.is_plugin_trusted(&plugin_id);
+                let (status, enabled, reason) = if !issues.is_empty() {
+                    ("invalid-manifest".to_string(), false, None)
+                } else if !is_trusted {
+                    (
+                        "untrusted".to_string(),
+                        false,
+                        Some(format!("not loaded: project-local plugin is enabled but not trusted in this checkout. Run `sm plugins trust {plugin_id}` to load it.")),
+                    )
                 } else {
-                    "enabled".to_string()
+                    ("enabled".to_string(), true, None)
                 };
 
                 drop_ins.push(DiscoveredPlugin {
                     id: plugin_id,
                     status,
-                    enabled: true,
+                    enabled,
                     description,
                     extensions: ext_values,
                     unloaded_extensions: unloaded,
                     manifest_summary: summaries.join(", "),
                     issues,
+                    reason,
+                    is_user: true,
                 });
             }
         }
@@ -442,16 +476,47 @@ pub fn run(cli: &Cli, scope: &Scope, args: &PluginsArgs) -> Result<u8, CliError>
                 });
                 println!("{}", serde_json::to_string_pretty(&out).unwrap());
             } else {
-                println!("Built-in plugins ({}):", built_ins.len());
-                for p in &built_ins {
-                    println!("  {} ({} extensions)", p.id, p.extensions.len());
+                struct Row {
+                    id: String,
+                    enabled: bool,
+                    ext_count: usize,
+                    source: String,
+                    reason: Option<String>,
                 }
-                if !drop_ins.is_empty() {
-                    println!("\nProject plugins ({}):", drop_ins.len());
-                    for p in &drop_ins {
-                        println!("  {} ({} extensions)", p.id, p.extensions.len());
+                let mut rows = Vec::new();
+                for b in &built_ins {
+                    rows.push(Row {
+                        id: b.id.clone(),
+                        enabled: b.enabled,
+                        ext_count: b.extensions.len(),
+                        source: "built-in".to_string(),
+                        reason: None,
+                    });
+                }
+                for p in &drop_ins {
+                    let inventory = p.extensions.len() + p.unloaded_extensions.len();
+                    rows.push(Row {
+                        id: p.id.clone(),
+                        enabled: p.enabled,
+                        ext_count: inventory,
+                        source: "user".to_string(),
+                        reason: p.reason.clone(),
+                    });
+                }
+
+                let id_width = rows.iter().map(|r| r.id.len()).max().unwrap_or(0);
+                let count_width = rows.iter().map(|r| r.ext_count.to_string().len()).max().unwrap_or(0);
+
+                for r in &rows {
+                    let glyph = if r.enabled { "✓" } else { "✕" };
+                    let id_col = format!("{:<width$}", r.id, width = id_width);
+                    let count_col = format!("{:>width$}", r.ext_count, width = count_width);
+                    println!("  {glyph}  {id_col} {count_col} ext   {}", r.source);
+                    if let Some(reason) = &r.reason {
+                        println!("       {reason}");
                     }
                 }
+                println!("\nTip: `sm plugins list <id>` for a plugin's extensions (kinds, versions, per-extension status), `sm plugins show <plugin>/<ext>` for one extension.");
             }
             Ok(0)
         }
@@ -459,30 +524,78 @@ pub fn run(cli: &Cli, scope: &Scope, args: &PluginsArgs) -> Result<u8, CliError>
             let (built_ins, drop_ins) = discover_plugins(scope);
             let elapsed_ms = started.elapsed().as_millis() as u64;
 
-            let mut enabled_count = 0;
-            let mut disabled_count = 0;
-            let mut issues = Vec::new();
-            let mut invalid_count = 0;
-
-            for p in built_ins.iter().chain(drop_ins.iter()) {
+            // countByStatus: built-in extensions by their flag; a user plugin
+            // counts once under its status, or its extensions when enabled.
+            const STATUS_ORDER: [&str; 7] =
+                ["enabled", "disabled", "incompatible-spec", "incompatible-catalog", "invalid-manifest", "load-error", "id-collision"];
+            let mut status_counts = [0usize; 7];
+            for p in &built_ins {
                 for ext in &p.extensions {
-                    if ext["enabled"].as_bool().unwrap_or(false) {
-                        enabled_count += 1;
-                    } else {
-                        disabled_count += 1;
+                    status_counts[if ext["enabled"].as_bool().unwrap_or(false) { 0 } else { 1 }] += 1;
+                }
+            }
+            let mut bad: Vec<&DiscoveredPlugin> = Vec::new();
+            let mut invalid_count = 0;
+            let mut issues = Vec::new();
+            for p in &drop_ins {
+                // sm lists an untrusted plugin as enabled with every extension unloaded.
+                if p.status == "untrusted" {
+                    status_counts[1] += p.extensions.len() + p.unloaded_extensions.len();
+                    continue;
+                }
+                if p.status != "enabled" && p.status != "disabled" {
+                    bad.push(p);
+                }
+                if let Some(i) = STATUS_ORDER.iter().position(|s| *s == p.status) {
+                    if p.status != "enabled" {
+                        status_counts[i] += 1;
                     }
                 }
-                disabled_count += p.unloaded_extensions.len();
-
+                if p.status == "enabled" {
+                    status_counts[0] += p.extensions.len();
+                    status_counts[1] += p.unloaded_extensions.len();
+                }
                 for iss in &p.issues {
                     issues.push(iss.clone());
                     invalid_count += 1;
                 }
             }
+            let enabled_count = status_counts[0];
+            let disabled_count = status_counts[1];
+
+            let contrib_errors = if scope.db_path().exists() {
+                if let Ok(conn) = store::open_existing(&scope.db_path()) {
+                    store::list_contribution_errors(&conn).unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
+            let contrib_errors_json: Vec<Value> = contrib_errors
+                .iter()
+                .map(|e| {
+                    let mut obj = json!({
+                        "pluginId": e.plugin_id,
+                        "extensionId": e.extension_id,
+                        "nodePath": e.node_path,
+                        "reason": e.reason,
+                        "message": e.message,
+                    });
+                    if let Some(cid) = &e.contribution_id {
+                        obj["contributionId"] = json!(cid);
+                    }
+                    if let Some(slot) = &e.slot {
+                        obj["slot"] = json!(slot);
+                    }
+                    obj
+                })
+                .collect();
 
             let loaded_count = enabled_count;
             let report = json!({
-                "ok": issues.is_empty(),
+                "ok": true,
                 "kind": "plugins.doctor",
                 "counts": {
                     "enabled": enabled_count,
@@ -495,19 +608,70 @@ pub fn run(cli: &Cli, scope: &Scope, args: &PluginsArgs) -> Result<u8, CliError>
                 },
                 "issues": issues,
                 "warnings": [],
-                "contributionErrors": [],
+                "contributionErrors": contrib_errors_json,
                 "elapsedMs": elapsed_ms,
             });
 
             if cli.global.json {
                 println!("{}", serde_json::to_string(&report).unwrap());
             } else {
-                println!("Plugins Doctor:");
-                println!("  Enabled: {enabled_count}");
-                println!("  Disabled: {disabled_count}");
-                println!("  Loaded: {loaded_count}");
+                // #renderHumanReport: summary, source and status tables, issues,
+                // runtime contribution errors (warnings are not computed here).
+                let plural = |n: usize| if n == 1 { "" } else { "s" };
+                println!(
+                    "plugins doctor: {enabled_count} enabled extension{} \u{b7} {} issue{} \u{b7} 0 warnings\n",
+                    plural(enabled_count),
+                    bad.len(),
+                    plural(bad.len())
+                );
+                println!("  Source");
+                println!("    {:<8}  {}", "built-in", built_ins.len());
+                println!("    {:<8}  {}", "user", drop_ins.len());
+                let width = STATUS_ORDER.iter().map(|s| s.len()).max().unwrap_or(0);
+                println!("\n  Status");
+                for (label, n) in STATUS_ORDER.iter().zip(status_counts) {
+                    println!("    {label:<width$}  {n}");
+                }
+                if !bad.is_empty() {
+                    println!("\n  Issues ({})", bad.len());
+                    for p in &bad {
+                        println!("    \u{2715}  {}  {}", p.id, p.status);
+                        for line in wrap_text(p.reason.as_deref().unwrap_or(""), 64) {
+                            println!("       {line}");
+                        }
+                    }
+                }
+                if !contrib_errors.is_empty() {
+                    let total = contrib_errors.len();
+                    println!("\n  Runtime contribution errors (last scan) ({total})");
+                    let mut by_plugin: Vec<(String, Vec<&ContributionError>)> = Vec::new();
+                    for err in &contrib_errors {
+                        if let Some((_, list)) = by_plugin.iter_mut().find(|(pid, _)| pid == &err.plugin_id) {
+                            list.push(err);
+                        } else {
+                            by_plugin.push((err.plugin_id.clone(), vec![err]));
+                        }
+                    }
+                    for (pid, list) in by_plugin {
+                        let count = list.len();
+                        println!("    \u{2715}  {pid}  ({count})");
+                        for err in list.iter().take(3) {
+                            for line in wrap_text(&err.message, 64) {
+                                println!("       {line}");
+                            }
+                        }
+                        if count > 3 {
+                            let hidden = count - 3;
+                            println!("       ... and {hidden} more");
+                        }
+                    }
+                }
             }
-            Ok(0)
+            if bad.is_empty() && contrib_errors.is_empty() {
+                Ok(0)
+            } else {
+                Ok(1)
+            }
         }
         PluginsCommand::Enable { ids, local, all: _ } => {
             toggle_plugins(scope, ids, true, *local)?;
@@ -527,19 +691,96 @@ pub fn run(cli: &Cli, scope: &Scope, args: &PluginsArgs) -> Result<u8, CliError>
             Ok(0)
         }
         PluginsCommand::Trust { ids } => {
+            scope.provision().map_err(|e| CliError::Operational(e.to_string()))?;
+            const BUILT_IN_IDS: &[&str] = &[
+                "core", "claude", "antigravity", "codex", "opencode", "agent-skills", "github", "test-plugin",
+            ];
             for id in ids {
-                println!("✓  Trusted plugin {id}");
+                if BUILT_IN_IDS.contains(&id.as_str()) {
+                    return Err(CliError::Raw(
+                        format!(
+                            "✕  Plugin \"{id}\" is a built-in (or host-locked) and is never import-trust-gated.\n   Import trust applies only to project-local drop-in plugins under .skill-map/plugins/."
+                        ),
+                        5,
+                    ));
+                }
+                scope.grant_plugin_trust(id).map_err(|e| CliError::Operational(e.to_string()))?;
+            }
+            if ids.len() == 1 {
+                print!("trusted: {}\n", ids[0]);
+            } else {
+                print!("trusted: {} plugin(s)\n", ids.len());
+                for id in ids {
+                    print!("  - {id}\n");
+                }
             }
             Ok(0)
         }
         PluginsCommand::Untrust { ids } => {
+            scope.provision().map_err(|e| CliError::Operational(e.to_string()))?;
+            const BUILT_IN_IDS: &[&str] = &[
+                "core", "claude", "antigravity", "codex", "opencode", "agent-skills", "github", "test-plugin",
+            ];
             for id in ids {
-                println!("✓  Untrusted plugin {id}");
+                if BUILT_IN_IDS.contains(&id.as_str()) {
+                    return Err(CliError::Raw(
+                        format!(
+                            "✕  Plugin \"{id}\" is a built-in (or host-locked) and is never import-trust-gated.\n   Import trust applies only to project-local drop-in plugins under .skill-map/plugins/."
+                        ),
+                        5,
+                    ));
+                }
+                scope.revoke_plugin_trust(id).map_err(|e| CliError::Operational(e.to_string()))?;
+            }
+            if ids.len() == 1 {
+                print!("untrusted: {}\n", ids[0]);
+            } else {
+                print!("untrusted: {} plugin(s)\n", ids.len());
+                for id in ids {
+                    print!("  - {id}\n");
+                }
             }
             Ok(0)
         }
-        PluginsCommand::Create { id } => {
-            println!("✓  Created plugin {id}");
+        PluginsCommand::Create { kind, plugin_id, at, force } => {
+            const VALID_KINDS: &[&str] = &["provider", "extractor", "analyzer", "action", "formatter", "hook"];
+            if !VALID_KINDS.contains(&kind.as_str()) {
+                return Err(CliError::Raw(
+                    format!(
+                        "✕  Unknown extension kind (got: {kind}).\n   Use one of: provider, extractor, analyzer, action, formatter, hook."
+                    ),
+                    2,
+                ));
+            }
+            if !is_valid_plugin_id(plugin_id) {
+                return Err(CliError::Raw(
+                    format!(
+                        "✕  Plugin id must be kebab-case lowercase (got: {plugin_id}).\n   Use a-z, 0-9, and hyphens between segments (e.g. `my-plugin`, `kw-counter`)."
+                    ),
+                    2,
+                ));
+            }
+            let target_dir = match at {
+                Some(p) => p.clone(),
+                None => scope.dir().join("plugins").join(plugin_id),
+            };
+            if target_dir.exists() && !*force {
+                return Err(CliError::Raw(
+                    format!(
+                        "✕  Refusing to overwrite {}.\n   Pass --force to overwrite the existing directory.",
+                        target_dir.display()
+                    ),
+                    2,
+                ));
+            }
+
+            scaffold_plugin(&target_dir, kind, plugin_id)?;
+
+            let main_file = format!("{kind}s/{plugin_id}-{kind}/index.js");
+            println!(
+                "Created {}\nNext:\n  - Edit {main_file}\n  - Run sm plugins doctor to confirm it loads\n  - Run sm plugins trust {plugin_id} to let its code run (project-local plugins are untrusted until you allow them)\n  - sm plugins slots list: browse slots and input-types",
+                target_dir.display()
+            );
             Ok(0)
         }
         PluginsCommand::Upgrade => {
@@ -579,5 +820,155 @@ fn toggle_plugins(scope: &Scope, ids: &[String], enable: bool, local: bool) -> R
             println!("  - {id}");
         }
     }
+    Ok(())
+}
+
+fn is_valid_plugin_id(id: &str) -> bool {
+    let mut chars = id.chars().peekable();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() => {}
+        _ => return false,
+    }
+    let mut last_was_hyphen = false;
+    for c in chars {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            last_was_hyphen = false;
+        } else if c == '-' {
+            if last_was_hyphen {
+                return false;
+            }
+            last_was_hyphen = true;
+        } else {
+            return false;
+        }
+    }
+    !last_was_hyphen
+}
+
+fn title_case(id: &str) -> String {
+    id.split('-')
+        .map(|p| {
+            let mut c = p.chars();
+            match c.next() {
+                None => String::new(),
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn scaffold_plugin(target_dir: &std::path::Path, kind: &str, plugin_id: &str) -> Result<(), CliError> {
+    std::fs::create_dir_all(target_dir).map_err(|e| CliError::Operational(e.to_string()))?;
+
+    let plugin_manifest = json!({
+        "version": "0.1.0",
+        "specCompat": "^1.12.7",
+        "catalogCompat": "^1.0.0",
+        "description": "Generated by `sm plugins create`. Edit to taste."
+    });
+    std::fs::write(
+        target_dir.join("plugin.json"),
+        serde_json::to_string_pretty(&plugin_manifest).unwrap_or_default() + "\n",
+    )
+    .map_err(|e| CliError::Operational(e.to_string()))?;
+
+    let package_json = json!({
+        "private": true,
+        "type": "module"
+    });
+    std::fs::write(
+        target_dir.join("package.json"),
+        serde_json::to_string_pretty(&package_json).unwrap_or_default() + "\n",
+    )
+    .map_err(|e| CliError::Operational(e.to_string()))?;
+
+    let ext_id = format!("{plugin_id}-{kind}");
+    let ext_dir = target_dir.join(format!("{kind}s")).join(&ext_id);
+    std::fs::create_dir_all(&ext_dir).map_err(|e| CliError::Operational(e.to_string()))?;
+
+    let ext_manifest = json!({
+        "version": "0.1.0",
+        "description": format!("Generated {kind} for {plugin_id}. Edit to taste.")
+    });
+    std::fs::write(
+        ext_dir.join("extension.json"),
+        serde_json::to_string_pretty(&ext_manifest).unwrap_or_default() + "\n",
+    )
+    .map_err(|e| CliError::Operational(e.to_string()))?;
+
+    let main_rel = format!("{kind}s/{ext_id}/index.js");
+    let readme = format!(
+        "# {plugin_id}\n\nGenerated by `sm plugins create {kind} {plugin_id}`. Edit `{main_rel}` to taste.\n\n## Verbs\n\n- `sm plugins trust {plugin_id}`: allow this project-local plugin's code to run (it is untrusted until you do)\n- `sm plugins list {plugin_id}`: manifest + extensions + load status\n- `sm plugins doctor`: full plugin diagnostic\n- `sm scan`: re-emit contributions / re-run analysis\n\n## Resources\n\n- `spec/plugin-author-guide.md`: authoring guide for every kind\n- `spec/view-slots.md`: the closed catalog of view slots\n- `spec/input-types.md`: the closed catalog of setting input-types\n- `sm plugins slots list`: browse the slot / input-type catalog from the CLI\n"
+    );
+    std::fs::write(target_dir.join("README.md"), readme).map_err(|e| CliError::Operational(e.to_string()))?;
+
+    let index_js = match kind {
+        "action" => {
+            let report_schema = json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "$id": format!("urn:skill-map:{plugin_id}/{ext_id}/report"),
+                "title": "DemoReport",
+                "description": "Report returned by the demo action. Deterministic: confidence is fixed at 1 and no injection is detected.",
+                "type": "object",
+                "required": ["confidence", "safety"],
+                "additionalProperties": false,
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+                    "safety": {
+                        "type": "object",
+                        "required": ["injectionDetected", "contentQuality"],
+                        "additionalProperties": false,
+                        "properties": {
+                            "injectionDetected": { "type": "boolean" },
+                            "contentQuality": {
+                                "type": "string",
+                                "enum": ["high", "medium", "low", "unknown"]
+                            }
+                        }
+                    }
+                }
+            });
+            std::fs::write(
+                ext_dir.join("report.schema.json"),
+                serde_json::to_string_pretty(&report_schema).unwrap_or_default() + "\n",
+            )
+            .map_err(|e| CliError::Operational(e.to_string()))?;
+
+            format!(
+                "/**\n * Generated by `sm plugins create`. Edit the invoke() body.\n *\n * Loader contract: default export object literal; `kind` (action) and id\n * (`{ext_id}`) come from the folder layout (structure-as-truth), so\n * neither is declared here. Every Action carries a sibling\n * `report.schema.json`; a deterministic Action must NOT carry a\n * `prompt.md` (that is the probabilistic surface).\n *\n * `invoke(input, ctx)` returns `{{ report, writes? }}`. The report must\n * match this folder's `report.schema.json` (which extends the shared\n * report-base: `confidence` + `safety`). `writes` is an optional\n * array of side-effect descriptors the kernel materialises after the\n * call returns (e.g. a sidecar write); keep `invoke()` itself pure.\n *\n * See: spec/plugin-author-guide.md, spec/schemas/extensions/action.schema.json\n */\nexport default {{\n  mode: 'deterministic',\n\n  invoke(input, ctx) {{\n    return {{\n      report: {{\n        ok: true,\n        confidence: 1,\n        safety: {{ injectionDetected: false, contentQuality: 'unknown' }},\n      }},\n    }};\n  }},\n}};\n"
+            )
+        }
+        "analyzer" => {
+            format!(
+                "/**\n * Generated by `sm plugins create`. Edit the evaluate() body.\n *\n * Loader contract: default export object literal; `kind` (analyzer) and\n * id (`{ext_id}`) come from the folder layout (structure-as-truth), so\n * neither is declared here. Re-declaring them is `invalid-manifest`.\n *\n * `evaluate(ctx)` runs once per scan and returns `Issue[]`. The kernel\n * stamps `analyzerId` from this extension's id and validates each issue\n * (`severity` must be 'error' | 'warn' | 'info'; off-spec issues drop\n * with an `extension.error` diagnostic). `ctx.nodes` / `ctx.links`\n * are the scanned graph; `ctx.accumulatedIssues` is the live issue\n * accumulator (read-only) for late-phase aggregate analyzers.\n *\n * See: spec/plugin-author-guide.md, spec/schemas/extensions/analyzer.schema.json\n */\nexport default {{\n  mode: 'deterministic',\n\n  evaluate(ctx) {{\n    const issues = [];\n    for (const node of ctx.nodes) {{\n      if (node.linksInCount === 0 && node.linksOutCount === 0) {{\n        issues.push({{\n          severity: 'info',\n          nodeIds: [node.path],\n          message: 'Node has no links in or out (isolated).',\n        }};\n      }}\n    }}\n    return issues;\n  }},\n}};\n"
+            )
+        }
+        "extractor" => {
+            format!(
+                "/**\n * Generated by `sm plugins create`. Edit the extract() body.\n *\n * Loader contract: the plugin loader resolves the extension via the\n * MODULE'S DEFAULT EXPORT (`export default {{ ... }}`). It must be an\n * object literal; renaming or splitting into a named export surfaces as\n * a `load-error`.\n *\n * Folder convention: this file lives at\n * `extractors/{ext_id}/index.js`. The folder layout is the source of\n * truth (structure-as-truth): the loader derives `kind`\n * (`extractor`) from the parent folder and the id (`{ext_id}`) from\n * the leaf folder, and injects `pluginId` from the plugin, so none of\n * them are declared here. Re-declaring `kind` / `id` is rejected as\n * `invalid-manifest`.\n *\n * Declared view contributions (`ui`):\n *   - 'count' → slot `card.footer.left` (renders as a chip in the node\n *     card footer)\n *\n * Declared settings (`settings`):\n *   - 'keywords' (string-list) → exposed as ctx.settings.keywords\n *\n * View contributions: declare each one as a const, list it in `ui` by\n * shorthand, and pass that SAME const (by reference, not a string id) to\n * `ctx.emitContribution`. The kernel recovers the contribution from the\n * object identity. (Write the plugin in TypeScript and add\n * `satisfies IViewContribution` from '@skill-map/cli' to get a typed payload.)\n *\n * See: spec/plugin-author-guide.md §View contributions\n *      spec/view-slots.md\n */\nconst count = {{\n  slot: 'card.footer.left',\n  icon: '🔍',\n  label: 'kw',\n  emitWhenEmpty: false,\n}};\n\nexport default {{\n  scope: 'body',\n\n  settings: {{\n    keywords: {{\n      type: 'string-list',\n      label: 'Keywords to track',\n      default: ['TODO', 'FIXME'],\n      min: 1,\n    }},\n  }},\n\n  ui: {{ count }},\n\n  extract(ctx) {{\n    const keywords = (ctx.settings && ctx.settings.keywords) || ['TODO', 'FIXME'];\n    let total = 0;\n    for (const kw of keywords) {{\n      const re = new RegExp('\\\\b' + kw.replace(/[.*+?^${{}}()|[\\]\\\\]/g, '\\\\$&') + '\\\\b', 'gi');\n      total += (ctx.body.match(re) || []).length;\n    }}\n    if (total > 0) {{\n      ctx.emitContribution(count, {{ value: total }});\n    }}\n  }},\n}};\n"
+            )
+        }
+        "formatter" => {
+            format!(
+                "/**\n * Generated by `sm plugins create`. Edit the format() body.\n *\n * Loader contract: default export object literal; `kind` (formatter) and\n * id (`{ext_id}`) come from the folder layout (structure-as-truth). The\n * format id used by `sm graph --format {ext_id}` is the folder name; do\n * NOT declare `formatId` (derived, re-declaring it is invalid-manifest).\n *\n * `format(ctx)` returns a string. `ctx.scanResult` is the full\n * persisted scan (the canonical input); `ctx.nodes` / `ctx.links` /\n * `ctx.issues` are the same data split out for convenience. Output has\n * no trailing newline guarantee; the calling verb adds one if it needs.\n *\n * See: spec/plugin-author-guide.md, spec/schemas/extensions/formatter.schema.json\n */\nexport default {{\n  contentType: 'text/plain',\n\n  format(ctx) {{\n    const nodes = ctx.nodes || [];\n    const links = ctx.links || [];\n    const issues = ctx.issues || [];\n    return `nodes=${{nodes.length}} links=${{links.length}} issues=${{issues.length}}`;\n  }},\n}};\n"
+            )
+        }
+        "hook" => {
+            format!(
+                "/**\n * Generated by `sm plugins create`. Edit the on() body.\n *\n * Loader contract: default export object literal; `kind` (hook) and id\n * (`{ext_id}`) come from the folder layout (structure-as-truth). Hooks\n * are deterministic-only: to run LLM work, enqueue a probabilistic Action\n * via `ctx.queue('<plugin>/<action>', payload)` instead.\n *\n * `triggers` is the curated set this hook subscribes to (one of: boot,\n * scan.started, scan.completed, extractor.completed, analyzer.completed,\n * action.completed, job.completed, job.failed, shutdown).\n * `on(ctx)` reads the event off `ctx.event` (`ctx.event.data` is the\n * payload); the dispatcher catches errors so a throw never breaks the verb.\n *\n * See: spec/plugin-author-guide.md, spec/schemas/extensions/hook.schema.json\n */\nexport default {{\n  triggers: ['boot'],\n\n  async on(ctx) {{\n    const data = (ctx.event && ctx.event.data) || {{}};\n    // No-op demo. A real hook reacts here, e.g. inspect `data`, write a\n    // log line, or enqueue an action with ctx.queue(...).\n    void data;\n  }},\n}};\n"
+            )
+        }
+        "provider" => {
+            let label = title_case(plugin_id);
+            format!(
+                "/**\n * Generated by `sm plugins create`. Skeleton provider: edit classify()\n * and add a kind under `kinds/` (see the TODO below).\n *\n * Loader contract: default export object literal; `kind` (provider) and\n * id (`{ext_id}`) come from the folder layout (structure-as-truth). Do\n * NOT declare a `kinds` map here, it is rejected as invalid-manifest;\n * kinds are discovered from `kinds/<kindName>/` folders at the PLUGIN\n * root.\n *\n * `presentation` (label + hex color) is required: the UI reads it for\n * the lens dropdown, the topbar chip, and the per-node provider chip.\n * `read` configures file discovery (defaults to `.md` +\n * frontmatter-yaml when omitted). `classify(path, frontmatter)` returns\n * the node kind for files this provider owns, or null to let the file\n * fall through to the markdown fallback.\n *\n * TODO: this skeleton classifies nothing (returns null). To emit nodes:\n *   1. Pick a kind name, e.g. 'note'.\n *   2. Create `kinds/note/schema.json` (frontmatter JSON Schema,\n *      allOf + $ref to frontmatter/base.schema.json).\n *   3. Create `kinds/note/kind.json` ({{ \"ui\": {{ \"label\": \"...\",\n *      \"color\": \"#......\" }} }}).\n *   4. Return 'note' from classify() for the files you own.\n *\n * See: spec/plugin-author-guide.md, spec/schemas/extensions/provider.schema.json\n */\nexport default {{\n\n  presentation: {{\n    label: '{label}',\n    color: '#6b7280',\n  }},\n\n  read: {{ extensions: ['.md'], parser: 'frontmatter-yaml' }},\n\n  classify(path, frontmatter) {{\n    // TODO: return a kind name (see header) for files this provider owns.\n    void path;\n    void frontmatter;\n    return null;\n  }},\n}};\n"
+            )
+        }
+        _ => unreachable!(),
+    };
+
+    std::fs::write(ext_dir.join("index.js"), index_js).map_err(|e| CliError::Operational(e.to_string()))?;
     Ok(())
 }

@@ -182,7 +182,7 @@ pub fn get_job(conn: &Connection, id: &str) -> Result<Option<Value>, CliError> {
 
 fn public(mut job: Value) -> Value {
     if let Some(m) = job.as_object_mut() {
-        m.remove("nonce");
+        m.shift_remove("nonce");
     }
     job
 }

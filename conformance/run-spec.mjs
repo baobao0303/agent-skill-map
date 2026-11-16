@@ -1,5 +1,5 @@
 // Run the spec-owned conformance cases with the ORIGINAL runner against
-// either implementation: `node conformance/run-spec.mjs <sm|asm> [case-id...]`.
+// either implementation: `node conformance/run-spec.mjs <sm|agent-skill> [case-id...]`.
 import { readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,7 +10,7 @@ const { runConformanceCase } = await import(join(oracle, "cli", "dist", "conform
 const specRoot = join(oracle, "spec");
 const casesDir = join(specRoot, "conformance", "cases");
 const [which, ...only] = process.argv.slice(2);
-const binary = which === "sm" ? join(oracle, "cli", "bin", "sm.js") : join(repo, "conformance", "asm-shim.cjs");
+const binary = which === "sm" ? join(oracle, "cli", "bin", "sm.js") : join(repo, "conformance", "agent-skill-shim.cjs");
 const ids = (only.length ? only : readdirSync(casesDir).map((f) => f.replace(/\.json$/, ""))).sort();
 let failed = 0;
 for (const id of ids) {

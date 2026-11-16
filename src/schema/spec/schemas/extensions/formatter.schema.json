@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skill-map.ai/spec/v1/extensions/formatter.schema.json",
+  "title": "ExtensionFormatter",
+  "description": "Manifest shape for a `Formatter` extension. A formatter serializes the graph (or a filtered subgraph) into a string in a declared format. The format id comes from the formatter's folder name (structure-as-truth, `<plugin>/formatters/<formatId>/index.ts`), it is NOT a manifest field. Invoked by `sm graph --format <formatId>` and `sm export`. Formatters are deterministic-only, they sit at the graph-to-string boundary and their output MUST be byte-deterministic for the same input graph (the snapshot-test suite relies on this). The `mode` field MUST NOT appear in formatter manifests. Probabilistic narrators of the graph are a valid product but they live in jobs and emit Findings, not in formatters. All formatters accept the `--filter` expression; opting out is no longer supported.",
+  "allOf": [
+    { "$ref": "base.schema.json" }
+  ],
+  "type": "object",
+  "unevaluatedProperties": false,
+  "properties": {
+    "contentType": {
+      "type": "string",
+      "default": "text/plain",
+      "description": "MIME-like hint used by the BFF when streaming formatted output over HTTP (e.g. `text/plain`, `image/svg+xml`, `application/json`). Advisory."
+    }
+  }
+}

@@ -1,0 +1,525 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skill-map.ai/spec/v1/extensions/provider.schema.json",
+  "title": "ExtensionProvider",
+  "description": "Manifest shape for a `Provider` extension. A Provider declares its own universe: the platform it recognises (Claude Code, Codex, Antigravity, Obsidian vault, generic MD), the catalog of node `kind`s it emits, and the per-kind frontmatter schema each kind follows. **Structure-as-truth**: exactly one Provider lives in each plugin that carries one, declared as `<plugin>/provider.ts`. The kinds catalog lives as folders under `<plugin>/kinds/<kindName>/` and the loader discovers each entry by walking that directory; the manifest itself NO LONGER carries a `kinds` map. Each kind folder MUST contain `schema.json` (the kind's frontmatter JSON Schema, extending `frontmatter/base.schema.json` via `allOf` + `$ref`) and `kind.json` (UI metadata under `{ ui: {...} }`). The kernel resolves these at boot time and registers each schema with AJV for scan-time validation. Exactly zero or one Provider MUST match any given file; multiple matches → `provider-ambiguous` issue, file unclassified. **`roots` is enforcement-grade**: a Provider declaring `roots` only receives files matching at least one glob; a Provider without `roots` acts as a fallback for files unmatched by any other Provider's roots. Providers are deterministic-only, they sit at the filesystem boundary and run during boot; probabilistic classification would make boot slow, costly, and non-reproducible. The `mode` field MUST NOT appear in Provider manifests. If you need LLM-assisted classification, write a probabilistic Action that runs as a queued job and writes back through the enrichment layer; Extractors are deterministic-only and Providers stay on the deterministic boot path. Distinct from the **hexagonal-architecture** 'adapter' (`StoragePort.adapter`, `FilesystemPort.adapter`, etc.), which is an internal driven-adapter implementing a port, Providers live in the extension surface, hexagonal adapters live in `src/kernel/adapters/`.",
+  "allOf": [
+    {
+      "$ref": "base.schema.json"
+    }
+  ],
+  "type": "object",
+  "required": [
+    "presentation"
+  ],
+  "unevaluatedProperties": false,
+  "properties": {
+    "presentation": {
+      "type": "object",
+      "required": [
+        "label",
+        "color"
+      ],
+      "additionalProperties": false,
+      "description": "Presentation metadata the UI uses to render this Provider's identity: the lens-switcher dropdown label, the topbar active-lens chip, and the per-node provider chip on cards. Required so the UI never hardcodes a closed provider list, it reads every registered Provider's identity from the `providerRegistry` field embedded in REST envelopes (`api/rest-envelope.schema.json`). Named `presentation` (NOT `ui`) because the shared extension `ui` key is the view-contributions map declared only by extractor / analyzer kinds. Mirrors the per-kind `provider-kind.schema.json#/ui` shape (label + base color, optional dark variant + emoji + icon) plus `hideChip` for fallback Providers that should not badge every node.",
+      "properties": {
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Human-readable Provider name shown in the active-lens dropdown, the topbar lens chip, and the per-node provider chip. Vendor lenses use a possessive `<Vendor>'s <product>` form (`\"Anthropic's Claude\"`, `\"OpenAI's Codex\"`, `\"Google's Antigravity\"`); the vendor-neutral open standard uses a `'Standard: <name>'` prefix (`'Standard: Agent skills'`). The non-gated `core/markdown` base keeps a `'Markdown'` label for internal lookups even though it is never a selectable lens."
+        },
+        "color": {
+          "type": "string",
+          "pattern": "^#[0-9a-fA-F]{6}$",
+          "description": "Base hex color (light theme) for the Provider chip. The UI derives any tints it needs from this value; declaring a single base keeps the manifest small. Deliberately distinct per Provider (unlike kind colors which normalise across Providers) so the chip tells the user at a glance which platform a node came from."
+        },
+        "colorDark": {
+          "type": "string",
+          "pattern": "^#[0-9a-fA-F]{6}$",
+          "description": "Optional dark-theme variant of `color`. When absent, the UI falls back to `color`."
+        },
+        "emoji": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8,
+          "description": "Optional decorative emoji used as a fallback when `icon` is absent or fails to render. Bound to a small length so the UI can lay it out predictably alongside text."
+        },
+        "icon": {
+          "description": "Optional discriminated icon descriptor. The UI prefers `icon` over `emoji`; when both are absent, the UI falls back to the first letter of `label` colored with `color`.",
+          "oneOf": [
+            {
+              "type": "object",
+              "required": [
+                "kind",
+                "id"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "const": "pi"
+                },
+                "id": {
+                  "type": "string",
+                  "pattern": "^pi-[a-z0-9]+(-[a-z0-9]+)*$",
+                  "description": "PrimeIcons identifier (e.g. `pi-cog`, `pi-bolt`). Matched verbatim against the `pi pi-<id>` class the UI emits."
+                }
+              }
+            },
+            {
+              "type": "object",
+              "required": [
+                "kind",
+                "path"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "const": "svg"
+                },
+                "path": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Raw SVG path data (the `d` attribute of one or more `<path>` elements, joined). The UI wraps it in `<svg viewBox=\"0 0 24 24\"><path d=\"...\"/></svg>` and tints it with `currentColor`."
+                }
+              }
+            }
+          ]
+        },
+        "hideChip": {
+          "type": "boolean",
+          "description": "When `true`, the UI does NOT paint this Provider's chip on node cards. Reserved for the universal base Provider (`markdown`): the majority of nodes in any project carry it, so badging every generic `.md` would be visual noise and dilute the chip's purpose (signalling when a node came from a NON-default platform). The markdown base is non-gated (`gatedByActiveLens: false`, `isLens: false`), so it is not a selectable lens and never appears in the active-lens dropdown or topbar lens chip either; `hideChip` additionally suppresses its per-card badge. Defaults to `false` (chip shown)."
+        },
+        "invocationSigil": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1,
+          "description": "Single glyph the lens's runtime uses to invoke a skill / command, surfaced as the `invokes` edge-kind glyph (and its tooltip example) in the link-kind palette so the operator recognises this lens's source syntax instantly. `/` for the slash-invoking lenses (`claude` commands + skills, `antigravity` skills + workflows), `$` for `codex` (whose skills are invoked `$skill`, with `/` reserved for Codex's own built-in commands). Omitted for lenses with no `/`/`$` invocation channel (the open-standard `agent-skills`, where skills activate by `description`, and the non-lens `markdown` base): under those lenses no `invokes` edge arises, so the palette never paints the glyph. Mirrors `IProviderUi.invocationSigil`; projected into `providerRegistry` (`api/rest-envelope.schema.json`) and joined client-side against the active lens."
+        }
+      }
+    },
+    "detect": {
+      "type": "object",
+      "required": [
+        "markers"
+      ],
+      "additionalProperties": false,
+      "description": "Auto-detection markers for the active-provider lens. The lens resolver checks each marker path (relative to the scope root) and, when present, suggests this Provider as a candidate lens. Replaces the former hardcoded detection table: the set of detectable Providers now derives from the registered Providers themselves. Optional, a Provider with no `detect` block is never auto-suggested (it can still be selected manually). When several Providers match, the resolver returns the full candidate list in Provider iteration order and the first match is the default suggestion. **Fallback precedence**: a Provider whose `detect.fallback` is `true` (the open-standard `agent-skills` lens, whose `.agents/` marker is also the shared skill home that vendor lenses populate) is dropped from the candidate list whenever any non-fallback (vendor) Provider also matched, so a project carrying `.codex/` alongside `.agents/` resolves to `codex` outright instead of prompting `codex` vs `agent-skills`. The fallback only stands when no vendor marker is present; several vendor markers still produce a genuine ambiguous list. **Compat subsumption**: `detect.subsumes` names Provider ids whose candidacy THIS Provider absorbs when both matched, a one-way \"I read that runtime's territory too\" relation, so a project carrying `.claude/` alongside `.opencode/` resolves to `opencode` outright instead of prompting.",
+      "properties": {
+        "markers": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Paths relative to the scope root whose existence signals this Provider's presence (e.g. `['.claude']`, `['.codex', 'AGENTS.md']`). A directory or a file both count; existence is the only test.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "fallback": {
+          "type": "boolean",
+          "description": "When `true`, this Provider is the open-standard FALLBACK lens: its markers produce a detection candidate ONLY when no non-fallback (vendor) Provider matched under the same scope. Reserved for `agent-skills`, whose `.agents/` marker is the shared open-standard skill home that vendor lenses (`codex`, `antigravity`) also populate; without this flag a `.codex/` + `.agents/` project would falsely read as an ambiguous `codex` vs `agent-skills` pair. Vendor Providers omit it (default `false`) so two vendor markers still surface a real ambiguous prompt. Mirrors `IProviderDetect.fallback`."
+        },
+        "subsumes": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Provider ids whose detection candidate this Provider ABSORBS when both matched under the same scope root. Declares a one-way compat relation: this Provider READS the named Provider's on-disk territory, so that territory's marker is expected inside a project of THIS lens and is not evidence the other runtime is in use. OpenCode is the reference case: it reads `.claude/skills/` (and `CLAUDE.md`) by design while Claude Code never reads `.opencode/`, so `.claude/` + `.opencode/` is not a genuine tie and `opencode` declares `subsumes: ['claude']`. Applied AFTER the `fallback` rule and only among matched vendors; a subsumed id is dropped from the candidate list, which can turn a would-be ambiguous prompt into an unambiguous auto-detect. Strictly one-way: when two matched Providers subsume each other, both are kept and the ambiguity stands. Unknown or unmatched ids are ignored. Mirrors `IProviderDetect.subsumes`.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "roots": {
+      "type": "array",
+      "description": "Path globs (relative to scope root) that this Provider claims. **Enforcement-grade since structure-as-truth refactor**: a Provider declaring `roots` only receives files that match at least one entry of the array; a Provider without `roots` acts as a fallback and receives files unmatched by every other Provider's roots. Two Providers whose `roots` both match the same file produce a `provider-ambiguous` issue and the file stays unclassified. `sm plugins doctor` warns when no file matched a specific Provider's roots in the latest scan.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "scaffold": {
+      "type": "object",
+      "required": [
+        "skillDir"
+      ],
+      "additionalProperties": false,
+      "description": "Authoring targets for verbs that MATERIALISE files into this Provider's on-disk territory (today only `sm tutorial`, which drops a skill folder where the Provider's runtime will discover it). Distinct from `detect` (which READS markers to suggest a lens) and from `classify` (which READS paths during a scan): `scaffold` is the WRITE side, the directory a generator drops new content into so the target runtime picks it up. Optional: a Provider with no `scaffold` block is never offered as a destination by a materialising verb (e.g. `antigravity`, whose skills and basic-track book are already covered by the open-standard `agent-skills` row, and `core/markdown`, which owns no authoring convention). The skill-folder convention is uniform across hosts (`<skillDir>/<name>/SKILL.md`), so a single `skillDir` is enough today; a future verb that scaffolds agents or commands adds a sibling field (`agentDir`, `commandDir`) without breaking this one.",
+      "properties": {
+        "skillDir": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^\\.?[A-Za-z0-9][A-Za-z0-9._/-]*$",
+          "description": "Directory (relative to the scope root) under which a materialising verb writes a skill folder, e.g. `.claude/skills` for Claude, `.agents/skills` for the open standard (also Codex, whose skills adopt that layout). The verb appends `/<skillName>/SKILL.md`. Relative, no leading slash and no `..` traversal (the pattern forbids both); the consuming verb joins it onto the cwd."
+        },
+        "marker": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^\\.?[A-Za-z0-9][A-Za-z0-9._/-]*$",
+          "description": "Optional directory the materialising verb creates so the active-lens resolver picks THIS Provider when its `skillDir` is shared with another lens. The open `.agents/skills` territory is read by several lenses (`agent-skills`, `antigravity`, `codex`), so a Provider whose skillDir is that shared territory but whose lens needs a distinct marker (e.g. Codex's `.codex`) declares it here, and `sm tutorial --for <id>` drops the marker alongside the skill so the project resolves the intended lens. Omitted when the skillDir's own parent IS the marker (`.claude/skills` → the `.claude` marker)."
+        },
+        "aka": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Display-only hints naming the agents that consume this Provider's scaffold territory AND share its tutorial track, shown in parentheses next to the Provider label in the `sm tutorial` destination prompt (e.g. the open-standard `.agents/skills` `agent-skills` Provider lists Google's Antigravity, which shares both the territory and the basic track; OpenAI's Codex also reads that territory but is a rich-track lens, so it is NOT listed here, advertising it under the basic row would hand it the wrong book). Purely presentational: these strings are NOT matched by `--for` (only registered Provider ids are) and have no runtime effect. Optional; absent means the prompt shows the bare Provider label.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "sharedWith": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Qualified id of the Provider that OWNS this `skillDir` when the territory is SHARED. Declared consumer-side: `antigravity` and `opencode` both read the open `.agents/skills` territory that `agent-skills` owns, so they name the owner here instead of duplicating ownership. It splits the two questions `scaffold` answers: a verb that offers a DESTINATION CHOICE (`sm tutorial`) lists owners only, so one territory stays one row, while a per-lens probe asking \"does THIS lens support / have the skill?\" (`sm agent install` / `status`, `GET /api/agent/install`, the Quick Start row) resolves a sharing lens normally, because a skill materialised in the shared territory IS discovered by that runtime. Omitted when the Provider owns its `skillDir`."
+        }
+      }
+    },
+    "mcpConfig": {
+      "type": "object",
+      "required": [
+        "sources"
+      ],
+      "additionalProperties": false,
+      "description": "MCP config-discovery capability (see architecture.md §Provider · MCP config discovery). Declares the config file(s) this Provider's runtime reads for MCP server declarations and their dialect. The kernel reads + parses each source once per scan (shared parser, the single owner of every MCP grammar) and materialises one virtual `mcp://<server>` node per declared server, canonical over the consumer-side `core/mcp-tools` emission. Optional: absent means the Provider surfaces MCP only from the consumer side (`tools:` references).",
+      "properties": {
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Config files to read for declared MCP servers.",
+          "items": {
+            "type": "object",
+            "required": [
+              "path",
+              "dialect"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "path": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^\\.?[A-Za-z0-9][A-Za-z0-9._/-]*$",
+                "description": "Config file path relative to the scope root (e.g. `.mcp.json`, `.codex/config.toml`). No leading slash and no `..` traversal (the pattern forbids both). Project-local; a home-scoped source is not expressible here."
+              },
+              "dialect": {
+                "type": "string",
+                "enum": [
+                  "json-mcp-servers",
+                  "toml-mcp-servers"
+                ],
+                "description": "Config grammar: `json-mcp-servers` (a JSON file with an `mcpServers` map, e.g. Claude `.mcp.json`, Cursor `.cursor/mcp.json`) or `toml-mcp-servers` (a TOML file with `[mcp_servers.*]` tables, e.g. Codex `.codex/config.toml`). Both are read into the same normalised descriptor."
+              }
+            }
+          }
+        }
+      }
+    },
+    "mcpRegister": {
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "additionalProperties": false,
+      "description": "MCP registration recipe (see architecture.md §Provider · MCP registration): how an operator declares skill-map's OWN MCP server to this Provider's runtime. The write-side counterpart of `mcpConfig` (which is the read side, discovering servers a project already declares), and deliberately separate: `mcpConfig` names project-local files skill-map PARSES, while registration targets the operator's personal config, so a Provider may declare either, both, or neither. The UI renders whatever is declared as a one-click Copy affordance; a Provider that declares nothing falls back to handing over the bare endpoint URL, which every MCP client accepts. Two flavours because only some runtimes ship an `mcp` CLI verb: the rest are configured by editing a config file.",
+      "oneOf": [
+        {
+          "required": [
+            "command"
+          ],
+          "not": {
+            "required": [
+              "config"
+            ]
+          },
+          "properties": {
+            "kind": {
+              "const": "command"
+            }
+          }
+        },
+        {
+          "required": [
+            "config"
+          ],
+          "not": {
+            "required": [
+              "command"
+            ]
+          },
+          "properties": {
+            "kind": {
+              "const": "config"
+            }
+          }
+        }
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "command",
+            "config"
+          ],
+          "description": "`command` = a shell command the operator runs; `config` = a document the operator saves into a config file. Selects which sibling block is required."
+        },
+        "command": {
+          "type": "object",
+          "required": [
+            "template"
+          ],
+          "additionalProperties": false,
+          "description": "The `command` flavour: the runtime ships an `mcp` CLI verb, so registration is one shell line.",
+          "properties": {
+            "template": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Shell command with the `{{url}}` placeholder standing in for skill-map's live MCP endpoint (e.g. `claude mcp add --transport http --scope local skill-map {{url}}`). MUST contain `{{url}}` at least once; the consumer substitutes the endpoint reported by `GET /api/mcp/status` and copies the result verbatim. No other placeholder is defined."
+            }
+          }
+        },
+        "config": {
+          "type": "object",
+          "required": [
+            "target",
+            "document"
+          ],
+          "additionalProperties": false,
+          "description": "The `config` flavour: the runtime has no `mcp` verb, so registration means saving a JSON document.",
+          "properties": {
+            "target": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Where the document goes, shown as the paste hint (e.g. `~/.config/opencode/opencode.json`). Display only: skill-map NEVER writes this file, and a `~/` target is legitimate here precisely because the operator applies it by hand, not the scanner (the never-read-$HOME invariant is untouched)."
+            },
+            "document": {
+              "type": "object",
+              "description": "A COMPLETE config document declaring skill-map's server, ready to save as a brand-new file (the target usually does not exist yet, and a bare fragment would leave a first-time operator assembling JSON by hand). Any string value containing `{{url}}` gets the live endpoint substituted, at any depth."
+            }
+          }
+        }
+      }
+    },
+    "activity": {
+      "type": "object",
+      "required": [
+        "install"
+      ],
+      "additionalProperties": false,
+      "description": "Optional live-activity capability (see `spec/provider-activity.md`). Declared by Providers whose runtime exposes a hook system that can report skill / agent / command invocations in real time, so the map can light the matching node while the operator works. Like `scaffold`, this is a provider-owned capability sub-object, NOT a new extension kind: the Provider that owns the on-disk layout and invocation grammar also owns how its runtime reports invocations. The manifest half is this declarative `install` descriptor; the event-mapping half is the runtime `mapEvent()` method (TypeScript-only, MUST NOT appear in the manifest, mirroring `classify()` / `walk()`), which turns one raw provider hook payload into zero or more `{ kind, name, phase, owner? }` signals that the BFF resolves against the scanned node set via the Provider's kind identifiers. Providers without a hookable runtime (the open-standard `agent-skills` as a pure format, the `core/markdown` base) omit the whole block and are never offered by `sm activity install`.",
+      "properties": {
+        "install": {
+          "type": "object",
+          "required": [
+            "kind",
+            "configPath"
+          ],
+          "additionalProperties": false,
+          "description": "Declarative install descriptor consumed by `sm activity install <provider>`: where the provider's PROJECT-LOCAL hook config lives and which install shape applies. Installation merges non-destructively (pre-existing operator hooks are preserved), is consent-prompted, targets only paths inside the scope root (never `$HOME`), and is exactly reversed by `sm activity uninstall`.",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "json-hooks",
+                "plugin-file"
+              ],
+              "description": "Install shape. `json-hooks`: merge hook entries that spawn the activity bridge command into a JSON settings/hooks file (Claude `.claude/settings.json`, Codex `.codex/hooks.json`, Antigravity `.agents/hooks.json`). `plugin-file`: write an in-process plugin file that POSTs to the ingest route directly, no spawn (opencode `.opencode/plugins/`). Closed set; adding a member is a minor spec bump."
+            },
+            "configPath": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^\\.?[A-Za-z0-9][A-Za-z0-9._/-]*$",
+              "description": "Path of the provider's hook config file (for `json-hooks`) or the plugin file to write (for `plugin-file`), relative to the scope root. No leading slash and no `..` traversal (the pattern forbids both); the consuming verb joins it onto the cwd, keeping installation project-local by construction."
+            },
+            "events": {
+              "type": "array",
+              "minItems": 1,
+              "description": "For `json-hooks` only (a `plugin-file` descriptor MUST omit it, enforced below): the provider lifecycle events to wire the bridge into, each with an optional matcher in the provider runtime's OWN matcher grammar. Only the events the runtime `mapEvent` actually consumes belong here (every wired event spawns one bridge process at runtime). The in-process analog for `plugin-file` providers is the runtime `pluginHooksSource` half (TypeScript-only, never manifest data): hook registrations are code, not declarative events.",
+              "items": {
+                "type": "object",
+                "required": [
+                  "event"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "event": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Provider runtime event name, verbatim (e.g. `PreToolUse`)."
+                  },
+                  "matcher": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Optional matcher in the provider's own grammar (e.g. a Claude tool regex `^(Skill|Agent)$`). Omitted = the event's match-all form."
+                  },
+                  "optIn": {
+                    "type": "string",
+                    "enum": ["shell"],
+                    "description": "Marks the event as OPT-IN: the install renders it only when the matching operator choice is on (`shell` -> the project-local `activity.shellCapture` key, set by `sm activity install --shell`; provider-activity.md, Capture level rung 5). Omitted = always rendered."
+                  },
+                  "entryShape": {
+                    "type": "string",
+                    "enum": [
+                      "wrapped",
+                      "flat"
+                    ],
+                    "description": "Entry shape the runtime expects for this event's array. `wrapped` (default): the `{ matcher?, hooks: [...] }` group tool events use. `flat`: a bare `{ type, command }` entry, the shape Antigravity's lifecycle events (PreInvocation / PostInvocation / Stop) take. Matchers do not apply to flat entries."
+                  }
+                }
+              }
+            },
+            "group": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+              "description": "For `json-hooks` with a NAMED-GROUP document shape (Antigravity's `.agents/hooks.json` maps group names to event maps): the top-level group key skill-map owns in the hook document. Install writes the event entries under this group; uninstall removes exactly it. Omitted = the conventional `hooks` container key (Claude / Codex), where operator entries coexist and removal is marker-filtered. The inner per-event shape is identical either way."
+            },
+            "commandCwd": {
+              "type": "string",
+              "enum": [
+                "scope-root",
+                "config-dir"
+              ],
+              "description": "Working directory the provider runtime spawns hook commands with, which decides how the bridge command's script path is written. `scope-root` (default): the runtime spawns at the project root, the plain scope-relative bridge path resolves. `config-dir` (Antigravity, live-verified): the runtime spawns at the hook config's own directory, so install prefixes the relative hops from `dirname(configPath)` back to the root. Ignored when `projectDirEnvVar` is declared, since that form is absolute at spawn time. The bridge itself derives its scope root from its installed location, never the spawn cwd."
+            },
+            "projectDirEnvVar": {
+              "type": "string",
+              "pattern": "^[A-Z][A-Z0-9_]*$",
+              "description": "Name of an environment variable the runtime sets to the PROJECT ROOT when it spawns a hook command, if it offers one (Claude Code: `CLAUDE_PROJECT_DIR`). When declared, install anchors the bridge path on it (`node \"$VAR\"/.skill-map/activity/bridge.js <provider>`) and `commandCwd` no longer applies. Implementations SHOULD prefer this over the cwd-relative forms wherever the runtime provides it: those forms assume the hook is spawned at the project root, and that assumption is not stable for the lifetime of a session, since an agent that changes directory while working takes the hook cwd with it and every later hook then fails to find the bridge. An absolute literal would also defeat the cwd problem and introduce a worse one, because these hook configs are routinely committed and a baked machine-specific path breaks every other contributor; the variable is portable and cwd-immune at once. Quote the VARIABLE only, not the whole path, so an expansion containing spaces survives and the bare `.skill-map/activity/bridge.js` substring stays intact for the ownership marker uninstall keys on. Declaring a name the runtime does not actually set is worse than omitting the field: an unset variable expands to empty and the path resolves at the filesystem root, so the hook breaks always rather than only from a subdirectory."
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "kind": {
+                    "const": "plugin-file"
+                  }
+                },
+                "required": [
+                  "kind"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "events": false,
+                  "group": false,
+                  "commandCwd": false,
+                  "projectDirEnvVar": false
+                },
+                "description": "`events` / `group` / `commandCwd` / `projectDirEnvVar` parameterize the spawned-bridge wiring and are meaningless for an in-process plugin: a `plugin-file` descriptor carries only `kind` + `configPath`. `projectDirEnvVar` is forbidden here for the same reason as `commandCwd`, there is no spawn, so there is no command path to anchor and no spawn cwd to be immune from."
+              }
+            }
+          ]
+        },
+        "spawnCustody": {
+          "type": "string",
+          "enum": [
+            "blocking",
+            "napping"
+          ],
+          "default": "napping",
+          "description": "How this runtime holds custody while a spawned child runs, which decides what an OWNER-SCOPED END means for the spawns that owner PARENTS. `napping` (the default, Claude's shape): the parent may go idle while its child works, so its owner-scoped end is ambiguous, a pause or a real termination, and consumers treat it as a pause (a liveness refresh) while that owner still parents a live spawn; the terminal end arrives once the whole descendant chain unwound. `blocking` (OpenCode's shape): the parent BLOCKS inside the spawn call and cannot report idle while a child runs, so an owner-scoped end from it is unambiguously TERMINAL and releases the spawns it parents too. Consumed by the BFF, which stamps `terminal: true` on the `node.activity` owner-release frame of a `blocking` runtime; without it a spawn whose completion never arrives (a refused or crashed call) stays drawn until the client's decay sweep. Declarative on purpose: it is a fact about the runtime's execution model, not a per-event decision."
+        }
+      }
+    },
+    "gatedByActiveLens": {
+      "type": "boolean",
+      "description": "Lens gating flag. When `true`, this Provider is a **lens**: its `classify()` only runs (and the walker only iterates its territory) if `provider.id === activeProvider` (the project's active lens), and it is offered in the active-lens dropdown / `selectable` set (projected to the envelope entry as `isLens: true`). When `false` or omitted (default), the Provider is a universal **base**: it classifies unconditionally on every scan and is never offered as a selectable lens (`isLens: false`). Vendor providers (`claude`, `codex`, `antigravity`) and the open-standard `agent-skills` provider MUST set this `true`: the actual runtimes never read each other's on-disk formats (Claude Code does not consume `.codex/`; Codex CLI does not consume `.claude/`), and offering every file to every provider fabricates cross-vendor graph edges the runtimes themselves reject. Only the markdown fallback `core/markdown` (and any future format-based fallback) keeps this `false`, the single universal base beneath whatever lens is active, never offered as a selectable lens. The resolver always yields a concrete lens (a vendor id, or `agent-skills` as the open default when no vendor marker is present), so there is no unlensed branch. Affects classification ONLY; extractors continue to filter via their own `precondition.provider` allowlist."
+    },
+    "resolverRules": {
+      "type": "object",
+      "description": "Per-provider ranking hints consumed by the Signal IR resolver phase. Drives intra-Signal candidate ranking AND cross-Signal range-overlap tiebreaks. Optional; absent means the resolver uses the default tiebreak chain (confidence DESC -> range length DESC -> extractor registration order). Distinct from the post-walk `resolution` confidence-lift matrix on Link (which runs on already-emitted edges, not Signal candidates): `resolverRules` decides which candidate becomes a Link in the first place; `resolution` lifts confidence on links that survived. The two surfaces share no mechanism and intentionally do not compose.",
+      "additionalProperties": false,
+      "properties": {
+        "kindPriority": {
+          "type": "array",
+          "description": "When present, the resolver ranks candidates whose `kind` appears earlier in this array ABOVE candidates whose `kind` appears later. Candidates whose `kind` is absent from the array drop to the end (after every listed kind). Example: a Provider that wants `invokes` edges to win against `mentions` and `references` of the same range declares `['invokes', 'references', 'mentions']`. Ties inside the same `kindPriority` bucket fall through to the confidence -> range length -> declaration order tiebreaks.",
+          "items": {
+            "type": "string",
+            "enum": [
+              "invokes",
+              "references",
+              "mentions",
+              "points"
+            ]
+          }
+        }
+      }
+    },
+    "resolution": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "propertyNames": {
+        "enum": [
+          "invokes",
+          "references",
+          "mentions",
+          "points"
+        ]
+      },
+      "description": "Strict resolution matrix consumed by the post-walk confidence-lift transform: maps a `link.kind` (emitted by an Extractor in this Provider's plugin, e.g. `invokes`, `mentions`) to the set of target `node.kind` values that count as a valid resolution. A link whose normalised trigger matches a node's identifier (see the kinds' `identifiers`) is lifted to confidence `1.0` only when that node's kind appears in `resolution[link.kind]`; otherwise it keeps its extractor-emitted confidence (the name exists but does not resolve AS THIS link.kind). Keys are restricted to the closed link-kind set; values are kind names this Provider declares under `kinds/`. Absent means no name-based confidence bump applies (path matches are unaffected). Distinct from `resolverRules` (Signal IR candidate ranking); `resolution` runs against the merged Link graph."
+    },
+    "reservedNames": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "description": "Per-kind catalog of names the provider runtime reserves for its own built-in commands / verbs, so a user node named after one is flagged. Maps a kind name (a key of the Provider's `kinds/` catalog) to the reserved names for that kind. Two consumers share it: the `core/name-reserved` analyzer emits a `warn` when a node's normalised identifiers intersect the reserved list for its provider + kind (the runtime silently shadows the user file), and the post-walk confidence-lift transform floors any link resolving to a reserved node. Lookup normalises both sides via the trigger normalization pipeline, so `Init-Project` in the manifest matches a user `init project`. Scope each entry to the kind the runtime actually consumes (a name reserved for commands may legitimately appear as a skill). Absent means no reserved names."
+    },
+    "read": {
+      "description": "Declarative file-discovery config consumed by the kernel walker. Either a SINGLE rule (the common case) or an ARRAY of rules (a Provider that reads several file families, each with its own parser). For each rule the kernel walks every root, includes files whose extension matches the rule's `extensions`, parses each with the rule's `parser`, and yields raw nodes the orchestrator consumes; an array runs one walk pass per rule. When absent, the kernel applies the default `{ extensions: ['.md'], parser: 'frontmatter-yaml' }` so the most common Provider shape needs no configuration. When a Provider also declares the runtime `walk()` method (TypeScript-only, never appears in this manifest), `walk()` wins and `read` is ignored: the runtime field is the escape hatch for Providers with non-standard discovery requirements. The multi-rule array is the declarative path for a mixed-format Provider, so an escape-hatch `walk()` is not needed: the OpenAI Codex provider reads `.toml` sub-agents (parser `toml`, `bodyField: 'developer_instructions'`) AND `.md` open-standard skills (parser `frontmatter-yaml`) as two rules. Rules SHOULD declare disjoint `extensions`; if two rules (or a rule and another Provider) match the same path, the orchestrator's first-wins claim dedups it. Built-in parsers ship with the kernel (`frontmatter-yaml`, `plain`, `toml`); the set is closed by design and user plugins cannot register their own.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/providerReadRule"
+        },
+        {
+          "type": "array",
+          "minItems": 1,
+          "description": "Multiple read rules, one walk pass each (see `#/$defs/providerReadRule`).",
+          "items": {
+            "$ref": "#/$defs/providerReadRule"
+          }
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "providerReadRule": {
+      "type": "object",
+      "required": [
+        "extensions",
+        "parser"
+      ],
+      "additionalProperties": false,
+      "description": "One declarative read rule: an extension set, the parser to apply to those files, and an optional `bodyField`. A Provider's `read` is either one of these or an array of them.",
+      "properties": {
+        "extensions": {
+          "type": "array",
+          "minItems": 1,
+          "description": "File extensions the walker yields for this rule. Strings include the leading dot. Lowercase-only by convention, match is case-sensitive and Providers MUST list every casing they want recognised.",
+          "items": {
+            "type": "string",
+            "pattern": "^\\.[a-z0-9]+$"
+          }
+        },
+        "parser": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Identifier of a parser registered in the kernel-internal registry. Built-ins: `frontmatter-yaml` (markdown with `--- … ---` YAML frontmatter, prototype-pollution-safe, `js-yaml` JSON_SCHEMA-pinned), `plain` (entire body, empty frontmatter, for files carrying no frontmatter convention; the Provider derives `name` from the path inside `classify()`), `toml` (whole-file TOML parsed as structured frontmatter, e.g. Codex `.codex/agents/*.toml`). Unknown ids surface as `UnknownParserError` from the walker; the orchestrator translates the error into a Provider issue with status `invalid-manifest`."
+        },
+        "bodyField": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional name of a parsed-frontmatter field that holds the node's markdown body. When set and `frontmatter[bodyField]` is a string, the kernel walker yields that string as the node `body` (so the body hash, byte counts, and every body-scoped extractor, markdown-link / at-directive / slash / backtick-path / external-url, see it) instead of the parser's own `body` output. Use it for formats whose prompt lives inside structured frontmatter rather than after a fence: OpenAI Codex sub-agents are pure TOML (`parser: 'toml'`) whose markdown prompt is the triple-quoted `developer_instructions` field, so the codex provider declares `bodyField: 'developer_instructions'`. The field remains in `frontmatter` as well, so frontmatter-scoped extractors are unaffected. When absent or not a string, the parser's own `body` is used unchanged (the default for `.md` providers)."
+        }
+      }
+    }
+  }
+}

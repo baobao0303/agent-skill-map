@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # P3 issues dismiss / undismiss / suppressions differential (claude-coverage).
-# Usage: issues.sh <sm|asm> <workdir>
+# Usage: issues.sh <sm|agent-skill> <workdir>
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
-BIN=$([ "$1" = sm ] && echo "$REPO/oracle/node_modules/.bin/sm" || echo "$REPO/target/release/asm")
+BIN=$([ "$1" = sm ] && echo "$REPO/oracle/node_modules/.bin/sm" || echo "$REPO/target/release/agent-skill")
 W=$2
 rm -rf "$W" && cp -a "$REPO/conformance/fixtures/claude-coverage" "$W" && rm -rf "$W/.skill-map"
 cd "$W" || exit 1

@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skill-map.ai/spec/v1/extensions/base.schema.json",
+  "title": "ExtensionBase",
+  "description": "Base shape common to every extension kind, describing what an extension's MODULE may declare. Kind-specific schemas (`provider`, `extractor`, `analyzer`, `action`, `formatter`, `hook`) extend this via `allOf` and add a kind-specific shape. The fields the loader must know BEFORE importing the module (`version`, `description`, `stability`, `defaultEnabled`) are deliberately NOT here: they live on disk at `<plugin>/<kind-plural>/<id>/extension.json` (`extension-manifest.schema.json`). The enabled decision depends on `stability` / `defaultEnabled`, so reading them out of the module would mean executing code to learn whether that code was allowed to execute at all. A module re-declaring any of the four is rejected by the kind schemas' `unevaluatedProperties: false`. Both `id` and `kind` are likewise derived from the filesystem structure (`<plugin>/<kind-plural>/<id>/index.ts`, where the parent folder dictates the kind and the leaf folder dictates the id), so they are NOT manifest fields either; manifests carrying `id` or `kind` are rejected as `invalid-manifest`. Closed-content enforcement (unknown keys = bug) lives on the kind schemas via `unevaluatedProperties: false`; those see base's evaluated keys through the `allOf` composition.",
+  "type": "object",
+  "properties": {
+    "order": {
+      "type": "number",
+      "description": "Optional visual ordering hint, inspector-only. Inside a plugin's inspector section (which groups the plugin's `inspector.body.panel.*` contributions), the bricks contributed by each extension are sorted ASC by this value (default 100), tie-break by the contribution's `priority` then qualified id. Does NOT affect execution order, which is governed by `phase` (analyzers) and registration order."
+    },
+    "annotation": {
+      "type": "object",
+      "required": ["schema"],
+      "additionalProperties": false,
+      "description": "Optional, opt-in declaration of a single sidecar annotation key contributed by this extension. The key is the extension's id (i.e. the leaf folder name). Extensions that need multiple annotation keys split into multiple extensions. The runtime exposes the registered catalog via `kernel.getRegisteredAnnotationKeys()` for UI autocomplete; the built-in `core/annotation-field-unknown` Analyzer emits a warning on truly unrecognized keys (typo guard). See `plugin-author-guide.md` §Annotation contribution.",
+      "properties": {
+        "schema": {
+          "type": "object",
+          "description": "Inline JSON Schema for this contribution's value. The value can be a scalar, an array, or a rich object; the schema is full JSON Schema. Validated when the kernel routes a sidecar write through this extension's namespace (or root key, see `location`). An invalid schema rejects the extension at load with `invalid-manifest`."
+        },
+        "ownership": {
+          "enum": ["exclusive", "shared"],
+          "default": "shared",
+          "description": "Conflict policy for this key. `shared` (default): the key is namespaced by default; multiple plugins MAY contribute to the same key, last-write-wins per the SidecarStore's deep-merge semantics. `exclusive`: only this plugin may write the key. REQUIRED when `location: 'root'` (a top-level reserved key cannot be silently shared between plugins)."
+        },
+        "location": {
+          "enum": ["namespaced", "root"],
+          "default": "namespaced",
+          "description": "Where the key lands inside the sidecar. `namespaced` (default): written under the plugin's `<plugin-id>:` block at the sidecar root. `root`: written as a top-level key alongside the reserved blocks (`for`, `annotations`, `settings`, `audit`); requires `ownership: 'exclusive'` and is treated as elevated trust (two plugins claiming the same root key with `exclusive` is a hard-fail at orchestrator init)."
+        }
+      }
+    },
+    "settings": {
+      "type": "object",
+      "additionalProperties": { "$ref": "../input-types.schema.json#/$defs/ISettingDeclaration" },
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+      },
+      "description": "Extension user-configurable settings. Each entry picks an `input-type` from the closed catalog at `input-types.schema.json#/$defs/InputTypeName`. The extension author NEVER writes JSON Schema for settings, they pick by `type` name and provide per-type parameters (label, default, min/max, options for enums, etc.). The kernel exposes the resolved settings via `ctx.settings.<settingId>` to the extension's runtime methods (`extract`, `evaluate`, `invoke`, etc.); the UI generates a form per declaration; the CLI's `sm plugins config <plugin>/<extension>` exposes the same surface. Settings are read once at extension invocation; changing a setting requires `sm scan` to re-emit (per ROADMAP.md decision D4). Settings live per-extension (not per-plugin) since the structure-as-truth refactor."
+    }
+  }
+}

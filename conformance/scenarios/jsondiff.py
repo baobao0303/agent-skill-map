@@ -11,7 +11,7 @@ def scrub(v):
     return v
 
 def load(p):
-    # The two runs live in sibling workdirs (…/rn-sm vs …/rn-asm).
+    # The two runs live in sibling workdirs (…/rn-sm vs …/rn-agent-skill).
     text = open(p).read().replace(p.rsplit(".", 2)[0], "<W>")
     return scrub(json.loads(text))
 
@@ -23,7 +23,7 @@ for k in a:
         if isinstance(a[k], list):
             for i, (x, y) in enumerate(zip(a[k], b[k])):
                 if x != y:
-                    print(k, i, "\n  sm :", json.dumps(x, ensure_ascii=False)[:600], "\n  asm:", json.dumps(y, ensure_ascii=False)[:600]); break
+                    print(k, i, "\n  sm :", json.dumps(x, ensure_ascii=False)[:600], "\n  agent-skill:", json.dumps(y, ensure_ascii=False)[:600]); break
             if len(a[k]) != len(b[k]): print(k, "len", len(a[k]), len(b[k]))
         else:
             print(k, a[k], b.get(k))

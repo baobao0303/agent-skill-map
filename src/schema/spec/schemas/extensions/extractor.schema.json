@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skill-map.ai/spec/v1/extensions/extractor.schema.json",
+  "title": "ExtensionExtractor",
+  "description": "Manifest shape for an `Extractor` extension. An extractor consumes a parsed node (frontmatter + body) and emits output through three context-supplied callbacks rather than returning a value: `ctx.emitLink(link)` writes to the kernel's `links` table (validated against the global closed enum of link kinds before persistence; per-extractor whitelisting was retired with structure-as-truth, the global enum is the contract), `ctx.enrichNode(partial)` merges author-canonical properties into the kernel's enrichment layer (separate from the author-supplied frontmatter), `ctx.emitContribution(id, payload)` emits per-node view contributions validated against the slot payload schema, and `ctx.store` persists into the plugin's own KV namespace. The runtime method is `extract(ctx) → void`. Extractors run in isolation: they MUST NOT read other nodes, the graph, or the DB. Cross-node reasoning lives in Analyzers. Extractors are deterministic-only: pure code, runs synchronously inside `sm scan`, same input → same output every run. LLM-driven enrichment of a node is an Action concern (queued as a job), not an Extractor concern.",
+  "allOf": [
+    { "$ref": "base.schema.json" }
+  ],
+  "type": "object",
+  "unevaluatedProperties": false,
+  "properties": {
+    "scope": {
+      "type": "string",
+      "enum": ["frontmatter", "body", "both"],
+      "default": "both",
+      "description": "Which part of the node this extractor consumes. The kernel passes only the declared scope to the extractor, a `frontmatter` extractor that tries to read `body` receives an empty string."
+    },
+    "precondition": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional declarative filter. The extractor runs only on nodes that satisfy every declared sub-filter. Same shape used by Analyzer and Action so the kernel ships a single matcher.",
+      "properties": {
+        "kind": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*/[a-z][a-zA-Z0-9]*$"
+          },
+          "description": "Qualified node kinds the extractor accepts, written as `<provider-plugin>/<kindName>` (e.g. `claude/agent`). Qualified by design so two providers declaring the same kind name never collide. Unknown qualified kinds (no provider declares them) load OK but emit a `precondition-kind-unknown` warning in `sm plugins doctor`."
+        },
+        "provider": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+          "description": "Provider ids whose nodes the extractor accepts. Coarser than `kind`. Useful when an extractor applies to every kind a given provider declares."
+        }
+      }
+    },
+    "ui": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "../view-slots.schema.json#/$defs/IViewContribution"
+      },
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+      },
+      "description": "Plugin-contributed view contributions. Each entry declares one rendering surface in the UI by picking a `slot` name from the closed catalog at `view-slots.schema.json#/$defs/SlotName`. The kernel validates the manifest at load (`invalid-manifest` on unknown slot); the extractor emits per-node payloads via `ctx.emitContribution(<contributionId>, payload)` during scan; the runtime validates payloads against the slot's payload schema in `view-slots.schema.json#/$defs/payloads/<slot>`; off-shape payloads emit `extension.error` and drop silently (mirror of `emitLink` off-contract drop). The kernel exposes the runtime catalog via `kernel.getRegisteredViewContributions()`; the BFF surfaces it at `GET /api/contributions/registered`. Only `extractor` and `analyzer` kinds may declare this field. Renamed from `viewContributions` with the structure-as-truth refactor."
+    }
+  }
+}

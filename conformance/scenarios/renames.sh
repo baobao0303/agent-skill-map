@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # P2 incremental/rename differential: run the same edit sequence under sm
-# and asm, writing each scan's JSON to <workdir>.N.json.
-# Usage: renames.sh <sm|asm> <workdir>
+# and agent-skill, writing each scan's JSON to <workdir>.N.json.
+# Usage: renames.sh <sm|agent-skill> <workdir>
 set -e
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
-BIN=$([ "$1" = sm ] && echo "$REPO/oracle/node_modules/.bin/sm" || echo "$REPO/target/release/asm")
+BIN=$([ "$1" = sm ] && echo "$REPO/oracle/node_modules/.bin/sm" || echo "$REPO/target/release/agent-skill")
 W=$2
 rm -rf "$W" && cp -a "$REPO/conformance/fixtures/claude-coverage" "$W" && rm -rf "$W/.skill-map"
 cd "$W"

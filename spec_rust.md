@@ -479,11 +479,57 @@ Tất cả các pha từ P1 đến P6 đã hoàn thành đầy đủ, đạt đ�
 
 ```bash
 cargo build --release && cargo test --release
-node conformance/run-spec.mjs asm            # 51/51 passed
-conformance/scenarios/bump.sh asm /tmp/test
-conformance/scenarios/sidecars.sh asm /tmp/test
-conformance/scenarios/issues.sh asm /tmp/test
-conformance/scenarios/orphans.sh asm /tmp/test
-conformance/scenarios/renames.sh asm /tmp/test
-conformance/scenarios/watch.sh asm /tmp/test
+node conformance/run-spec.mjs agent-skill            # 51/51 passed
+conformance/scenarios/bump.sh agent-skill /tmp/test
+conformance/scenarios/sidecars.sh agent-skill /tmp/test
+conformance/scenarios/issues.sh agent-skill /tmp/test
+conformance/scenarios/orphans.sh agent-skill /tmp/test
+conformance/scenarios/renames.sh agent-skill /tmp/test
+conformance/scenarios/watch.sh agent-skill /tmp/test
 ```
+
+### 18.3 Review 2026-11-14 — 8 lỗi đã sửa (review lại sau `53e4e88`, sửa ở commit kế tiếp)
+
+Review lại sau `53e4e88` cho thấy lỗi 1, 2, 3 vẫn làm giả: `conformance run` vẫn báo pass khi không tìm thấy runner; lỗi 2 và 3 vẫn dò chuỗi trong source JS của plugin. Thêm lỗi mới: shim conformance dùng `spawnSync`, nên khi runner gửi SIGTERM thì process `serve` con không bị tắt, giữ pipe và làm `agent-skill conformance run` treo. Đã sửa hết:
+
+| # | Mức | Vị trí | Vấn đề ban đầu | Cách sửa |
+|---|---|---|---|---|
+| 1 | cao | `src/cli/conformance.rs` | báo pass khi không chạy được case | Chạy từng case bằng runner gốc (`runConformanceCase`) qua một shim tạm trỏ vào chính binary đang chạy. Tìm spec và runner theo `SM_SPEC_ROOT`, project, cwd hoặc thư mục của binary. Không tìm thấy thì báo lỗi exit 2 (`runner-unavailable`). Case lỗi runtime thì tính là `runtime-error`. Có case fail thì exit 1 và in đủ chi tiết, stdout, stderr như `sm`. Đã bỏ danh sách case cứng. |
+| 2 | cao | `src/plugins/runtime.rs`, `src/scan/analyze.rs` | đoán `adjustConfidence` từ source JS | Plugin được chạy thật: `src/plugins/bridge.mjs` import module trong `node` và gọi `evaluate(ctx)` với `nodes`, `links`, `adjustConfidence` (chỉ ở phase score) và `emitContribution`. Các op score của plugin được gộp chung với op built-in trong một lần fold, theo thứ tự (pluginId, extensionId) như `applyConfidenceAdjustments`. Analyzer được xếp theo phase score → detect → aggregate. Issue của plugin đi qua `validateIssue` (severity sai thì bị bỏ) và issueSuppressions. |
+| 3 | cao | `src/plugins/runtime.rs`, `src/plugins/schema.rs` | thông báo dựng từ tên fixture hoặc dò chuỗi | Manifest (module default sau khi bỏ function và `pluginId`) được kiểm bằng `extensions/<kind>.schema.json`. Payload contribution được kiểm bằng `view-slots.schema.json#/$defs/payloads/<slot>`. Ref không khai báo được phát hiện theo object identity ngay trong bridge. Bộ kiểm JSON Schema tự viết, cho thông báo giống AJV (`allErrors`), và `format_errors` là bản port của `formatAjvErrors`. Có thêm kiểm `pluginId`, DERIVED, EXTENSION_JSON keys, và trả `load-error` khi import lỗi hoặc thiếu `node`. |
+| 4 | cao (bảo mật) | `src/plugins/manager.rs`, `src/kernel/scope.rs` | plugin chưa trust vẫn nạp | (`5e8d620`) Trust ghi trong `scope.lock.json`. Runtime kiểm trust và enable trước khi import, nên plugin chưa trust không có dòng code nào chạy và cũng không spawn `node`. |
+| 5 | cao (bảo mật) | `src/server/serve.rs` | thiếu kiểm Host/Origin, CORS `*` | Thêm loopback gate như `sm`: header `Host` phải là loopback; `Origin` trên `/api/*`, `/ws`, `/mcp` phải là loopback; sai thì trả 403 `host-not-allowed` / `origin-not-allowed`. Thêm security header (CSP, X-Frame-Options, nosniff, Referrer-Policy). So token bằng phép so sánh thời gian hằng. CORS chỉ bật khi có `--dev`, với cùng giá trị header như `sm`. |
+| 6 | trung | `src/jobs/queue.rs` | `submittedBy` bị dời vị trí | (`5e8d620`) dùng `shift_remove`. |
+| 7 | trung | `src/jobs/history.rs` | text `history` / `history stats` khác | (`5e8d620`) port đúng layout. |
+| 8 | trung | `src/plugins/manager.rs` | `plugins list` khác định dạng | (`5e8d620`) đếm đúng, định dạng như `sm`. |
+| 9 | cao | `conformance/agent-skill-shim.cjs` | shim để sót process `serve`, làm `conformance run` treo | `spawn` bất đồng bộ và chuyển tiếp SIGTERM/SIGINT/SIGHUP (`c2e9ebb`). |
+
+### 18.4 Cập nhật 2026-11-15 — Hoàn thành 4 hạng mục runtime plugin & contribution DB
+
+1. **Lưu contribution vào DB**:
+   - Bảng `scan_contributions` lưu đầy đủ contributions hợp lệ từ cả plugin và các built-in extractors/analyzers/actions (`link-counter`, `annotation-stale`, `issue-counter`, `ai-summarizer-action`, `ai-tagger-action`, `node-set-tags`, `node-bump`, `node-stability`, `external-url-counter`, `tools-counter`).
+   - Duy trì dọn dẹp tăng dần qua 4-stage sweep (orphan sweep, catalog sweep, per-tuple sweep, upsert).
+   - Lỗi phát sinh từ payload sai schema hoặc contribution ref chưa khai báo được ghi nhận vào bảng `scan_contribution_errors`. Lệnh `plugins doctor` đọc từ bảng này để hiển thị trên cả định dạng text (nhóm theo plugin, giới hạn 3 mẫu kèm `... and N more`) và `--json`.
+
+2. **Chạy extractor của plugin**:
+   - Port `extract` qua `src/plugins/bridge.mjs` với đầy đủ context affordances (`emitLink`, `enrichNode`, `emitContribution`, `emitSignal`, `emitNode`, `log`).
+   - Tích hợp vào engine scan tăng dần với cache hit check dựa trên sha256 canonical resolved settings.
+
+3. **`ctx.settings` cho plugin**:
+   - Resolve cấu hình theo từng extension từ manifest `settings` và file `.skill-map/settings.json` / `.skill-map/settings.local.json`.
+   - Kiểm tra kiểu dữ liệu với toàn bộ 12 `input-type` (`string-list`, `single-string`, `boolean-flag`, `integer`, `number`, `enum-pick`, `enum-multipick`, `path-glob`, `regex`, `secret`, `key-value-list`, `match-list`).
+   - Fallback về default khai báo và in cảnh báo stderr đúng câu chữ khi giá trị override không hợp lệ.
+
+4. **Kiểm tra manifest cho provider plugin**:
+   - Nhúng `provider.schema.json` từ spec gốc.
+   - Hàm `stripActivityRuntimeFields` loại bỏ `pluginHooksSource` và `mapEvent` trước khi validate qua JSON Schema.
+
+Vẫn chưa làm:
+- Action, formatter và hook của plugin (ngoài extractor và analyzer) được import và kiểm manifest nhưng chưa chạy logic mở rộng riêng.
+- Chạy plugin cần có `node` trên PATH.
+
+Kiểm tra đối chiếu:
+- `node conformance/run-spec.mjs agent-skill` và `agent-skill conformance run`: 51/51. Không còn sót process `serve`.
+- `conformance/scenarios/plugins.sh` (9 case: các fixture có plugin, cộng các biến thể set/ceil, slot sai, payload sai, issue severity sai): khớp `sm` byte-for-byte.
+- `jobs.sh` (cả có và không có `TRUST=1`), `bump`, `sidecars`, `issues`, `orphans`, `renames`, `watch`: khớp `sm` byte-for-byte.
+- `cargo test`: 30/30.

@@ -3,56 +3,84 @@
 > High-performance Rust CLI & Visual Pipeline Engine for AI Agent Skills, Prompt Topology & Dynamic Execution.
 > Inspired by `skill-map` (https://skill-map.ai) and powered by `@foblex/flow` visual canvas primitives.
 
----
-
-## 1. Context & Motivation
-
-Multi-agent and skill ecosystems (Claude Code, Hermes Agent, Codex, SLPC) run into major operational bottlenecks when scaled:
-1. **Context Window Bloat**: Markdown skills consume tens of thousands of tokens without visibility.
-2. **Trigger Collision**: Multiple skills claiming overlapping keywords, causing wrong activations.
-3. **Broken Dependency Chains**: Agent handoffs or slash commands referencing missing skills or prompts.
-4. **Black Box Execution**: Lack of live topological visibility into what agents actually loaded and ran.
-
-`agent-skill-map` (`asm`) is a native Rust reimplementation delivering **10-50x faster scanning**, **zero runtime overhead (<20MB RAM)**, and **instant CI/Pre-commit gating**, coupled with an interactive DAG canvas.
-
----
-
-## 2. Conversation & Research Transcripts
-
-- **Full Conversation Log**: [`CONVERSATION.md`](./CONVERSATION.md) — complete human-readable transcript of the design session.
-- **Raw Session Data**: [`conversation.json`](./conversation.json) — raw JSON session dump (`session_id: 20261113_135732_676438`).
-- **Crawled Foblex Flow Documentation**: `/home/baoltb/Desktop/codex-room-setup/docs/foblex-flow/`
-  - `llms-full.txt` (66KB full LLM reference)
-  - 55 core docs + 59 practical examples + 25 architecture deep dives
-  - 4 specialized skills: `foblex-flow-angular`, `foblex-flow-managed-state`, `foblex-flow-performance-and-layout`, `foblex-flow-diagnostics-and-rules`.
-
----
-
-## 3. Architecture Blueprint
-
-```
-agent-skill-map (Single Binary CLI: asm / agent-skill-map)
-├── crates/cli        -> Command line interface (clap v4)
-├── crates/core       -> AST parser (pulldown-cmark, gray_matter)
-├── crates/linter     -> Token counting (tiktoken-rs), collision detector
-├── crates/graph      -> DAG topological sort & cycle detection (petgraph)
-└── crates/server     -> Axum embedded HTTP & SSE server for Foblex Flow UI
-```
-
-### CLI Verbs
-- `asm scan [path]`: Fast parallel scan of skills and agent definitions.
-- `asm lint [path]`: Audit token weight, trigger collisions, and dead links.
-- `asm graph --format [mermaid|json|dot]`: Output topology.
-- `asm serve --port 3000`: Launch live interactive visualizer.
-
----
-
-## 4. Quickstart
+## 1. Build
 
 ```bash
-# Build
 cargo build --release
-
-# Run scanner against local Hermes skills
-./target/release/asm scan ~/.hermes/skills
 ```
+
+File chạy nằm ở `target/release/agent-skill`. Cho tiện, thêm nó vào PATH hoặc đặt alias:
+
+```bash
+alias agent-skill=/home/baoltb/Desktop/agent-skill-map/target/release/agent-skill
+```
+
+## 2. Dùng trên một project
+
+Vào thư mục project muốn quét (ví dụ thư mục có `.claude/skills`, `.claude/agents`):
+
+```bash
+agent-skill scan
+```
+Quét toàn bộ và lưu đồ thị vào DB.
+
+```bash
+agent-skill list
+```
+Liệt kê các node đã quét.
+
+```bash
+agent-skill check
+```
+Xem các lỗi tìm được, ví dụ link gãy hoặc reference không tồn tại.
+
+```bash
+agent-skill graph
+```
+In đồ thị ra.
+
+```bash
+agent-skill watch
+```
+Theo dõi thay đổi và tự quét lại.
+
+Các lệnh khác:
+- `orphans`, `issues`: xử lý file mồ côi, file bị đổi tên, và tắt cảnh báo cho từng node.
+- `bump`, `sidecars`: quản lý file sidecar `.sm`, gồm version và hash.
+- `agent`, `jobs`, `record`, `findings`, `history`: hàng đợi job cho AI agent xử lý.
+- `config`, `plugins`, `enrich`, `serve`: cấu hình, plugin và HTTP server cục bộ.
+
+Lệnh nào cũng nhận `--json` để in ra máy đọc được, và `--db <file>` để đổi vị trí DB.
+Xem chi tiết một lệnh bằng `agent-skill <lệnh> --help`.
+
+## 3. Phát triển và kiểm tra (cho người sửa code)
+
+Chạy test và lint:
+
+```bash
+cargo test && cargo clippy
+```
+
+Chạy bộ conformance chính thức (`agent-skill` là bản Rust, `sm` là bản gốc):
+
+```bash
+node conformance/run-spec.mjs agent-skill
+```
+
+So từng kịch bản giữa `sm` và `agent-skill` bằng các file trong `conformance/scenarios/`:
+
+```bash
+conformance/scenarios/jobs.sh agent-skill /tmp/w-agent-skill
+```
+
+Bản gốc `sm` 1.12.7 nằm trong `oracle/node_modules` và không được sửa.
+Nếu clone sang máy mới mà thiếu thư mục này, cài lại:
+
+```bash
+cd oracle && npm i @skill-map/cli@1.12.7 --ignore-scripts
+```
+
+## 4. Tài liệu & Lưu ý
+
+- Toàn bộ 51/51 conformance test cases và các kịch bản so sánh (`jobs.sh`, `bump.sh`, `sidecars.sh`, `issues.sh`, `orphans.sh`, `renames.sh`, `watch.sh`) đã khớp với `sm` byte-by-byte.
+- Chi tiết thiết kế và trạng thái các pha: xem `spec_rust.md`.

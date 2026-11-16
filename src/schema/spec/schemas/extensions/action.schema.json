@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skill-map.ai/spec/v1/extensions/action.schema.json",
+  "title": "ExtensionAction",
+  "description": "Manifest shape for an `Action` extension. An action operates on one or more nodes in one of two modes: `deterministic` (code runs in-process, returns a report JSON directly) or `probabilistic` (kernel renders a prompt, a runner executes it against an LLM, the callback closes the job). **Structure-as-truth files**: every Action carries `<action-dir>/report.schema.json` (the JSON Schema for the report, MUST extend `report-base.schema.json`); probabilistic Actions additionally carry `<action-dir>/prompt.md` (the prompt template). An Action whose report schema extends the canonical node-summary schema (under `summaries/`, via `$ref`; today the single universal `summaries/markdown.schema.json`) is a summarizer: recording a `completed` job for it also upserts the validated report into `state_summaries` (see `job-lifecycle.md` §Record). The summarizer signal is the report schema itself; there is no manifest flag. The kernel resolves both by convention; missing or mis-placed files surface as `load-error`. A deterministic Action with a `prompt.md` in its folder is also `load-error` (config inconsistent). **`prob*` prefix convention**: manifest fields that only apply when `mode=probabilistic` start with `prob`; if a deterministic-only field ever appears, it starts with `det`.",
+  "type": "object",
+  "unevaluatedProperties": false,
+  "properties": {
+    "mode": {
+      "type": "string",
+      "enum": ["deterministic", "probabilistic"],
+      "default": "deterministic",
+      "description": "`deterministic` (default): the plugin's code computes the report synchronously, no job, no agent. `probabilistic`: the kernel renders `prompt.md` + preamble into a queued job; an external agent processes it via `sm jobs claim` and `sm record` closes it."
+    },
+    "probNodeless": {
+      "type": "boolean",
+      "default": false,
+      "description": "Declares that this probabilistic Action operates on NO node: its prompt asks nothing about project content, so a job for it carries no user content and needs no target. Submitting one skips target resolution entirely and enqueues against the synthetic node id `sm://<qualified-extension-id>`, which never resolves to a file; the on-disk read + drift verification (`job-lifecycle.md` §Submit step 8) is skipped along with it, since there is nothing on disk to read or to drift. The `{{userContent}}` seam still marks where the kernel injects its prelude (the report contract), but no `<user-content>` block is emitted. Today the single declarer is the system liveness probe `core/ai-ping-action`, which measures whether an agent is draining the queue, a fact about the AGENT, not about any file: aiming it at a real node made the probe fail whenever that node had been deleted since the last scan, and made it impossible to run at all on an empty corpus. Ignored unless `mode=probabilistic` (a deterministic Action runs in-process against a node it is given, and has no prompt to render)."
+    },
+    "probExpectedDurationSeconds": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Best-effort ADVISORY estimate of wall-clock duration when `mode=probabilistic`. It never arms an expiry (jobs carry no TTL unless the operator sets one, Decision #139); it feeds the `jobs-overdue` doctor check and display surfaces. Required for `probabilistic`; ignored otherwise. Renamed from `expectedDurationSeconds` with the structure-as-truth refactor, the `prob` prefix makes it clear at a glance which mode the field belongs to."
+    },
+    "io": {
+      "type": "array",
+      "items": { "enum": ["network"] },
+      "uniqueItems": true,
+      "description": "Declared IO capability. `invoke()` is pure by contract (no IO); an Action that MUST reach the network (e.g. the provenance verifier `github/enrichment`) declares `['network']` here, which (a) relaxes the purity rule for exactly that capability, (b) injects `ctx.fetch` into its invocation context (implementations MUST route remote calls through it, never a global), and (c) subjects execution to the project policy `allowNetworkActions` (default false: declared-network Actions load and list but are refused at execution with a directed advisory). Network Actions execute via `sm enrich`, never inside `sm scan` and never as queued jobs (the queue carries prompts for agents)."
+    },
+    "writes": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "enum": ["sidecar"] },
+      "description": "Declares the kinds of persistent writes this Action's `invoke()` may emit (mirrors `IActionResult.writes[].kind`). Today the only kind is `sidecar`: the Action creates or modifies a `.sm` annotation sidecar next to a source file. An Action whose `invoke()` returns a write of a given kind MUST declare that kind here; the declaration is the source of truth consumers gate on. When the `allowSidecarWriters: false` project policy is set, every Action that declares `sidecar` is dropped from the scan composer (its `inspector.action.button` never renders) and the sidecar store refuses the write. Absent = the Action performs no persistent writes (read-only / report-only)."
+    },
+    "precondition": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Declarative filter that nodes must satisfy for this action to be applicable. Consumed by `--all` fan-out, UI button gating, `sm actions show`. Also drives the inverse analyzer↔action relationship (Modelo B): `analyzerIds` declares which analyzers' findings this action is intended to resolve, replacing the deprecated `Analyzer.recommendedActions` map.",
+      "properties": {
+        "kind": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*/[a-z][a-zA-Z0-9]*$"
+          },
+          "description": "Qualified node kinds this action accepts (`<provider-plugin>/<kindName>`)."
+        },
+        "provider": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+          "description": "Provider ids whose nodes this action accepts."
+        },
+        "analyzerIds": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*/[a-z][a-z0-9-]*(:[a-z][a-z0-9-]*)?$"
+          },
+          "description": "Qualified analyzer ids whose findings this action is intended to resolve (Modelo B, replaces the deprecated `Analyzer.recommendedActions`). The UI surfaces matching actions in the node inspector under 'Resolve this issue' when the analyzer's id matches an entry here. Format `<plugin>/<analyzer>` or `<plugin>/<analyzer>:<sub-id>` when the analyzer emits sub-typed issues. Dangling references warn via `recommended-action-missing` in `sm plugins doctor` but do NOT block load."
+        },
+        "frontmatterMissing": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Frontmatter-gap gate: the action applies ONLY to nodes whose frontmatter is missing at least one of the listed fields (no frontmatter block, absent field, or empty-string value; a non-string value counts as present). Evaluated by the same node matcher as `kind` / `provider` (BFF launcher classification, `--all` fan-out), so a node already carrying every listed field never lists the action nor receives a fan-out job. E.g. `core/ai-frontmatter-action` declares `[\"name\", \"description\"]`: its standalone launcher renders only while the file is missing one of them."
+        }
+      }
+    },
+    "prompt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["inputType", "paramKey", "label"],
+      "properties": {
+        "inputType": {
+          "$ref": "../input-types.schema.json#/$defs/InputTypeName",
+          "description": "Input-type id from the closed catalog. The UI renders the matching control before dispatch."
+        },
+        "paramKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 48,
+          "description": "Key under which the UI-collected value is placed in the dispatch `input` body."
+        },
+        "label": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "options": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["value", "label"],
+            "properties": {
+              "value": { "type": "string" },
+              "label": { "type": "string" }
+            }
+          },
+          "description": "Choice list for `enum-pick` / `enum-multipick` input types."
+        }
+      },
+      "description": "Reserved (Steps 3+). When set, a parametrized Action declares the single user input it needs; the UI renders the matching input-type control before dispatch and places the value under `paramKey` in the dispatch body. Deterministic no-prompt actions (e.g. `node-bump`) omit it. Mirrors `view-slots.schema.json#/$defs/payloads/_ActionPrompt`."
+    },
+    "ui": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "../view-slots.schema.json#/$defs/IViewContribution"
+      },
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+      },
+      "description": "Plugin-contributed view contributions. Same contract as Extractor.ui / Analyzer.ui (slot-driven, payload-validated). An Action emits these during its scan-time `project()` self-projection (deterministic, side-effect-free, runs in the contribution phase), supplying the target node path explicitly per emission via `ctx.emitContribution(<nodePath>, <contributionId>, payload)`, the same signature Analyzer uses because the Action sees the full graph, not a single node. The canonical use is an Action declaring its OWN `inspector.action.button` so the button lives with the Action that dispatches it (no separate projector analyzer). `extractor`, `analyzer`, and `action` kinds may declare this field."
+    }
+  },
+  "allOf": [
+    { "$ref": "base.schema.json" },
+    {
+      "if": { "properties": { "mode": { "const": "probabilistic" } }, "required": ["mode"] },
+      "then": { "required": ["probExpectedDurationSeconds"] }
+    }
+  ]
+}

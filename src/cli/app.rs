@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "asm", version, about = "Map, inspect and audit AI-agent markdown ecosystems as a graph")]
+#[command(name = "agent-skill", version, about = "Map, inspect and audit AI-agent markdown ecosystems as a graph")]
 pub struct Cli {
     #[command(flatten)]
     pub global: Global,
@@ -348,7 +348,7 @@ pub fn dispatch(cli: &Cli) -> Result<u8, CliError> {
     let root = std::env::current_dir().map_err(|e| CliError::Operational(e.to_string()))?;
     let scope = Scope::new(root);
     let Some(command) = &cli.command else {
-        return Err(CliError::Usage("no verb given; run `asm --help`".into()));
+        return Err(CliError::Usage("no verb given; run `agent-skill --help`".into()));
     };
     match command {
         Command::Version => version(cli, &scope),
@@ -483,12 +483,12 @@ fn version(cli: &Cli, scope: &Scope) -> Result<u8, CliError> {
         "-".into()
     };
     if cli.global.json {
-        println!("{}", jsjson::to_string(&json!({ "asm": env!("CARGO_PKG_VERSION"), "spec": scan::SPEC_VERSION, "dbSchema": db_schema })));
+        println!("{}", jsjson::to_string(&json!({ "agent-skill": env!("CARGO_PKG_VERSION"), "spec": scan::SPEC_VERSION, "dbSchema": db_schema })));
     } else {
-        println!("  asm        {}", env!("CARGO_PKG_VERSION"));
-        println!("  spec       {}", scan::SPEC_VERSION);
-        println!("  runtime    Rust");
-        println!("  db-schema  {db_schema}");
+        println!("  agent-skill  {}", env!("CARGO_PKG_VERSION"));
+        println!("  spec         {}", scan::SPEC_VERSION);
+        println!("  runtime      Rust");
+        println!("  db-schema    {db_schema}");
     }
     Ok(0)
 }
@@ -528,18 +528,15 @@ fn resolve_lens(scope: &Scope, dry_run: bool, json_mode: bool) -> Result<String,
                 settings.insert("activeProvider".into(), json!(one));
                 settings.insert("activeProviderMarkers".into(), json!([one]));
                 scope.write_settings(&settings).map_err(|e| CliError::Operational(e.to_string()))?;
-                let notice = format!("Auto-detected activeProvider = {one} from filesystem markers; persisted to .skill-map/settings.json.");
-                // stdout carries only the document in --json mode.
-                if json_mode {
-                    eprintln!("{notice}");
-                } else {
-                    println!("{notice}");
-                }
+            }
+            // Announced on stdout like sm, which says nothing in --json mode.
+            if !json_mode {
+                println!("Auto-detected activeProvider = {one} from filesystem markers; persisted to .skill-map/settings.json.");
             }
             Ok(one.to_string())
         }
         many => Err(CliError::Usage(format!(
-            "several provider markers found ({}); pick one with `asm config set activeProvider <id>`",
+            "several provider markers found ({}); pick one with `agent-skill config set activeProvider <id>`",
             many.join(", ")
         ))),
     }
@@ -577,6 +574,7 @@ fn scan_opts(scope: &Scope, lens: String, tokenize: bool, max_scan: Option<u64>,
         tokenize,
         follow_external_symlinks: false,
         changed: None,
+        announce_plugins: false,
         ignored_references: settings
             .get("plugins")
             .and_then(|p| p.pointer("/core/extensions/reference-broken/settings/ignored-references"))
@@ -607,14 +605,23 @@ fn run_scan(cli: &Cli, scope: &Scope, flags: ScanFlags) -> Result<u8, CliError> 
         scope.provision().map_err(|e| CliError::Operational(e.to_string()))?;
     }
     let lens = resolve_lens(scope, dry_run, cli.global.json)?;
-    let opts = scan_opts(scope, lens, tokenize, max_scan, max_nodes);
+    let mut opts = scan_opts(scope, lens, tokenize, max_scan, max_nodes);
+    opts.announce_plugins = !cli.global.json;
     let db = db_path(cli, scope);
     let prior = load_prior(&db);
     if changed && prior.is_none() {
         eprint!("--changed: no prior snapshot found; running full scan.\n");
     }
-    let scan::Outcome { mut result, renames, extractor_runs } =
-        scan::run_incremental(&opts, prior.as_ref().map(|p| &p.0), prior.as_ref().filter(|_| !full).map(|p| &p.1), full);
+    let scan::Outcome {
+        mut result,
+        renames,
+        extractor_runs,
+        contributions,
+        contribution_errors,
+        registered_contribution_keys,
+        freshly_run_tuples,
+        enrichments,
+    } = scan::run_incremental(&opts, prior.as_ref().map(|p| &p.0), prior.as_ref().filter(|_| !full).map(|p| &p.1), full);
     if !dry_run {
         let mut conn = store::open(&db, &scope.backups_dir()).map_err(|e| CliError::Operational(e.to_string()))?;
         if result.nodes.is_empty() && !allow_empty {
@@ -625,7 +632,17 @@ fn run_scan(cli: &Cli, scope: &Scope, flags: ScanFlags) -> Result<u8, CliError> 
                 )));
             }
         }
-        store::persist(&mut conn, &mut result, &renames, &extractor_runs).map_err(|e| CliError::Operational(e.to_string()))?;
+        store::persist(
+            &mut conn,
+            &mut result,
+            &renames,
+            &extractor_runs,
+            &contributions,
+            &contribution_errors,
+            &registered_contribution_keys,
+            &freshly_run_tuples,
+            &enrichments,
+        ).map_err(|e| CliError::Operational(e.to_string()))?;
         scope.log_operation("scan", "cli", "ok", &format!("nodes={} issues={}", result.nodes.len(), result.issues.len()));
     }
     let errors = result.issues.iter().filter(|i| i.severity == "error").count();
@@ -704,10 +721,28 @@ fn run_watch(cli: &Cli, scope: &Scope, tokenize: bool, max_scan: Option<u64>, ma
      -> Result<ScanResult, String> {
         let mut opts = scan_opts(scope, lens.clone(), tokenize, max_scan, max_nodes);
         opts.changed = changed;
-        let scan::Outcome { mut result, renames, extractor_runs } =
-            scan::run_incremental(&opts, prior.as_ref().map(|p| &p.0), prior.as_ref().map(|p| &p.1), false);
+        let scan::Outcome {
+            mut result,
+            renames,
+            extractor_runs,
+            contributions,
+            contribution_errors,
+            registered_contribution_keys,
+            freshly_run_tuples,
+            enrichments,
+        } = scan::run_incremental(&opts, prior.as_ref().map(|p| &p.0), prior.as_ref().map(|p| &p.1), false);
         let mut conn = store::open(&db, &scope.backups_dir()).map_err(|e| e.to_string())?;
-        store::persist(&mut conn, &mut result, &renames, &extractor_runs).map_err(|e| e.to_string())?;
+        store::persist(
+            &mut conn,
+            &mut result,
+            &renames,
+            &extractor_runs,
+            &contributions,
+            &contribution_errors,
+            &registered_contribution_keys,
+            &freshly_run_tuples,
+            &enrichments,
+        ).map_err(|e| e.to_string())?;
         scope.log_operation("scan", "watcher", "ok", &format!("nodes={} issues={}", result.nodes.len(), result.issues.len()));
         Ok(result)
     };

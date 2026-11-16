@@ -145,8 +145,14 @@ fn materialise(s: &Signal) -> Link {
     }
 }
 
+/// `isExternalUrlLink`: any `scheme:` target, except the `mcp://` virtual-node scheme.
 pub fn is_external_url(target: &str) -> bool {
-    target.starts_with("http://") || target.starts_with("https://")
+    if target.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("mcp://")) {
+        return false;
+    }
+    let bytes = target.as_bytes();
+    let scheme_len = bytes.iter().take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')).count();
+    bytes.first().is_some_and(u8::is_ascii_alphabetic) && scheme_len >= 2 && bytes.get(scheme_len) == Some(&b':')
 }
 
 pub fn dedupe_links(links: Vec<Link>) -> Vec<Link> {

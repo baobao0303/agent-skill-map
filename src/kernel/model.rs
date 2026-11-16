@@ -46,8 +46,10 @@ pub struct Node {
 #[serde(rename_all = "camelCase")]
 pub struct ExternalRef {
     pub url: String,
-    pub line: u64,
-    pub original_trigger: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_trigger: Option<String>,
 }
 
 #[derive(Serialize, Clone, PartialEq)]
@@ -86,11 +88,13 @@ pub struct Link {
     pub kind: &'static str,
     pub confidence: f64,
     pub sources: Vec<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub raw: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger: Option<Trigger>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<Location>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub occurrences: Vec<Occurrence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_target: Option<String>,
@@ -136,6 +140,33 @@ impl Issue {
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.tail.get(key)
     }
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Contribution {
+    pub plugin_id: String,
+    pub extension_id: String,
+    pub node_path: String,
+    pub contribution_id: String,
+    pub slot: String,
+    pub payload: Value,
+    pub emitted_at: i64,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ContributionError {
+    pub plugin_id: String,
+    pub extension_id: String,
+    pub node_path: String,
+    pub reason: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contribution_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
+    pub emitted_at: i64,
 }
 
 #[derive(Serialize)]
